@@ -13,11 +13,15 @@ class slaterkonster:
         p = Path.cwd()/'ATOMS_BS'
 
         atoms = []
+        self.names = []          # element label per atom (file stem)
+        self.Znum = []           # atomic number (self.Z is taken by the z-grid)
 
         for entry in p.iterdir():
             if entry.is_file():
                 atom = np.load(entry,allow_pickle=True)
                 atoms.append(atom)
+                self.names.append(entry.stem)
+                self.Znum.append(int(atom['Z']))
 
         self.r = [data['grid'] for data in atoms]
         self.occupied = [data['occupied'].tolist() for data in atoms]
