@@ -82,7 +82,7 @@ class slaterkonster:
         
         R_tot = self.r[0][-1] + self.r[1]
 
-        distance = np.linspace(0.0,R_tot[-1],100)
+        distance = np.linspace(0.0,R_tot[-1],300)
         S_d = []
 
         for d in distance:
@@ -106,8 +106,8 @@ if __name__ == '__main__':
     print(f'  2s-2s sigma = {S0[(1, 0, 1, 0, 0)]:.4f}   (expect ~1, normalization)')
     print(f'  1s-2s sigma = {S0[(0, 0, 1, 0, 0)]:.4f}   (expect ~0, orthogonality)')
 
-    # --- full run at the placeholder distance ---
-    S = sk.Space_definment()
+    # --- full run at a physical placeholder distance ---
+    S = sk.Space_definment(2.0)
     print(f'\nfull run @ d_AB = {sk.d_AB:.2f} Bohr -- {len(S)} block(s)')
     cc = S[(carbon, carbon)]
     print(f'  1s-1s sigma (carbon-carbon) = {cc[(0, 0, 0, 0, 0)]:.3e}')

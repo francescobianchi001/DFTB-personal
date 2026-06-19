@@ -7,8 +7,6 @@ Saves one PNG per atom pair.
 """
 
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')                 # headless: write files, no window needed
 import matplotlib.pyplot as plt
 from SlaterKonster import slaterkonster as SK
 
@@ -67,7 +65,5 @@ for (i, j) in atom_pairs:
     ax.set_xlim(0, d[sig[-1]] * 1.15 if len(sig) else d[-1])
 
     fig.tight_layout()
-    fname = f'SK_overlap_{i}{j}_{elem(i)}{elem(j)}.png'
-    fig.savefig(fname, dpi=130)
-    plt.close(fig)
-    print(f'wrote {fname}  ({len(channels)} channels)')
+
+plt.show()      # display every figure on screen
