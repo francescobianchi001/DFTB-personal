@@ -22,7 +22,6 @@ class slaterkonster:
         self.r = [data['grid'] for data in atoms]
         self.occupied = [data['occupied'].tolist() for data in atoms]
         self.basisets =  [data['wavefunctions'].tolist() for data in atoms]
-
         if grid!=None:
             self.r = self.r[:grid]
             self.occupied = self.occupied
@@ -32,58 +31,43 @@ class slaterkonster:
                              for i in range(len(self.basisets))]
 
     def SK(self, BS_1, BS_2, d_AB):
-        """Two-center overlaps between basis sets BS_1 (atom A) and BS_2 (atom B),
-        separated by d_AB along z.
-
-        Data layout (confirmed): BS[shell][l] -> radial u(r) = r*R(r) on self.r.
-        So the angular momentum IS the inner index l.  For a bond there is a single
-        shared magnetic number (the phi selection rule m_A = m_B), so we loop one
-        bond channel o = 0..min(lA,lB):  0=sigma, 1=pi, 2=delta.
-        """
         S = {}
 
-        # distances from each centre to every grid point (atom A at z=0, B at z=d_AB)
         rA = np.sqrt(self.X**2 + self.Z**2)
         rB = np.sqrt(self.X**2 + (self.Z - d_AB)**2)
         grid_A, grid_B = self.r[self.i], self.r[self.j]
 
-        for nA in range(len(BS_1)):                  # principal shell, atom A
-            for lA in range(len(BS_1[nA])):          # angular momentum, atom A
-                for nB in range(len(BS_2)):          # principal shell, atom B
-                    for lB in range(len(BS_2[nB])):  # angular momentum, atom B
-                        for o in range(min(lA, lB) + 1):     # bond: sigma/pi/delta
-                            AW = Y_real.angular_weights[(lA, lB, o)]   # callable W(x,z,R)
-                            uA = np.asarray(BS_1[nA][lA])    # u_A = r*R_A on grid_A
-                            uB = np.asarray(BS_2[nB][lB])    # u_B = r*R_B on grid_B
+        for nA in range(len(BS_1)):                 
+            for lA in range(len(BS_1[nA])):        
+                for nB in range(len(BS_2)):       
+                    for lB in range(len(BS_2[nB])):  
+                        for o in range(min(lA, lB) + 1):     
+                            AW = Y_real.angular_weights[(lA, lB, o)]   
+                            uA = np.asarray(BS_1[nA][lA])    
+                            uB = np.asarray(BS_2[nB][lB])  
 
-                            # --- Wire A: R = u/r interpolated onto r_A, r_B (0 past grid)
                             R_A = np.interp(rA.ravel(), grid_A, uA/grid_A,
                                             right=0.0).reshape(rA.shape)
                             R_B = np.interp(rB.ravel(), grid_B, uB/grid_B,
                                             right=0.0).reshape(rB.shape)
 
-                            # --- Wire B: integrand R_A R_B W(x,z,R) * x , then 2D Simpson
                             integrand = R_A * R_B * AW(self.X, self.Z, d_AB) * self.X
-                            S_x = simpson(integrand, x=self.x, axis=0)   # over x (rho)
-                            value = simpson(S_x, x=self.z)               # over z
+                            S_x = simpson(integrand, x=self.x, axis=0)   
+                            value = simpson(S_x, x=self.z)              
 
                             S[(nA, lA, nB, lB, o)] = value
         return S
 
-
-
     def build_grid(self, d_AB, N=400):
-        ### cylindrical integration grid: x = rho (>=0), z along the bond axis ###
-        rmax = self.r[0][-1]                           # outer radial extent (~15 Bohr)
+        rmax = self.r[0][-1]                        
         self.d_AB = d_AB
-        self.x = np.linspace(1e-4, rmax, N)            # cylindrical radius (>= 0)
-        self.z = np.linspace(-rmax, d_AB + rmax, N)    # axial coord spanning both atoms
-        self.X, self.Z = np.meshgrid(self.x, self.z, indexing='ij')
+        self.x = np.linspace(1e-4, rmax, N)        
+        self.z = np.linspace(-rmax, d_AB + rmax, N)
+        self.X, self.Z = np.meshgrid(
+                self.x, self.z, indexing='ij')
 
-    def Space_definment(self):
-        # placeholder internuclear distance along z (we'll optimise R later)
-        R_tot = self.r[0][-1] + self.r[1]
-        d_AB = R_tot[-1]
+    def Space_definment(self,distance):
+        d_AB = distance
         self.build_grid(d_AB)
 
         S = {}
@@ -93,7 +77,18 @@ class slaterkonster:
                 self.j = j
                 S[(i, j)] = self.SK(self.basisets[i], self.basisets[j], d_AB)
         return S
+    
+    def distance_gradient(self):
+        
+        R_tot = self.r[0][-1] + self.r[1]
 
+        distance = np.linspace(0.0,R_tot[-1],100)
+        S_d = []
+
+        for d in distance:
+            S_d.append(self.Space_definment(d))
+
+        return S_d,distance
 
 if __name__ == '__main__':
     sk = slaterkonster()
