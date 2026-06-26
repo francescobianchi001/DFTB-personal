@@ -88,9 +88,6 @@ class H:
         return X,Z
 
     def build_basis(self):
-        # Flat list of atomic orbitals, one entry per (atom, n, l, m). Its index
-        # is the H/S row/column, so a separate index map is no longer needed.
-        # minimal_BS: keep only the outermost (valence) shell, freeze the core.
         self.basis = []
         self.nelec = 0                                       # electrons in the kept basis
         for a in range(len(self.basisets)):
@@ -109,7 +106,6 @@ class H:
         from Y_real import Y_real
         A, B = self.basis[mu], self.basis[nu]
 
-        # --- same atom: on-site block is DIAGONAL only --------------------
         if A.atom == B.atom:
             if mu == nu:
                 norm = simpson(A.u**2, x=A.grid)             # <phi|phi> ~ 1
@@ -121,7 +117,6 @@ class H:
                 self.H[mu, mu]   = self.eigN[A.atom][A.n][A.l]   # neutral on-site level
             return                                              # off-diag same-atom = 0
 
-        # --- different atoms: two-center, selection rule m_A == m_B -------
         if A.m != B.m:
             return                                              # -> 0 by symmetry
         o = abs(A.m)                                            # sigma/pi/delta channel
@@ -183,13 +178,16 @@ class H:
         return E, C
 
     def band_energy(self):
-        # Sum of occupied MO energies (closed shell: 2 e per lowest MO).
-        # self.nelec comes from build_basis -> valence electrons when minimal_BS.
         E, C = self.diag()
         nocc = int(round(self.nelec)) // 2
         return 2.0 * np.sum(E[:nocc])
 
     def density_matrix(self):
-        E,C = self.diag()
-        P = 0
-        pass
+        # One-particle density matrix in the (non-orthogonal) AO basis:
+        #   P_uv = 2 * sum_i^occ  C_ui C_vi   (closed shell).
+        # Check: trace(P @ S) = number of electrons.
+        E, C = self.diag()
+        nocc = int(round(self.nelec)) // 2
+        Cocc = C[:, :nocc]
+        P = 2.0 * Cocc @ Cocc.T
+        return P
