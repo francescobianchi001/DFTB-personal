@@ -14,7 +14,7 @@ AO = namedtuple('AO', 'atom n l m u grid')
 
 class H:
 
-    def __init__(self,distance,grid=None):
+    def __init__(self,distance,minimal_BS=True,grid=None):
 
         p_bs = Path.cwd()/'ATOMS_BS'
         p_pot = Path.cwd()/'ATOMS_POT'
@@ -62,6 +62,7 @@ class H:
 
         self.p = Path.cwd()
         self.distance = distance
+        self.minimal_BS = minimal_BS
 
     def SK_int_parametre(self, distance):
 
@@ -89,10 +90,15 @@ class H:
     def build_basis(self):
         # Flat list of atomic orbitals, one entry per (atom, n, l, m). Its index
         # is the H/S row/column, so a separate index map is no longer needed.
+        # minimal_BS: keep only the outermost (valence) shell, freeze the core.
         self.basis = []
+        self.nelec = 0                                       # electrons in the kept basis
         for a in range(len(self.basisets)):
-            for n in range(len(self.basisets[a])):
+            shells = ([len(self.basisets[a]) - 1] if self.minimal_BS
+                      else range(len(self.basisets[a])))
+            for n in shells:
                 for l in range(len(self.basisets[a][n])):
+                    self.nelec += self.occupied[a][n][l]     # valence electrons when minimal_BS
                     u = np.asarray(self.basisets[a][n][l])   # confined radial (basis shape)
                     for m in range(-l, l + 1):               # l=0 -> just m=0
                         self.basis.append(AO(a, n, l, m, u, self.r[a]))
@@ -175,3 +181,15 @@ class H:
         assert np.allclose(H @ C, S @ C @ np.diag(E), atol=1e-6)
 
         return E, C
+
+    def band_energy(self):
+        # Sum of occupied MO energies (closed shell: 2 e per lowest MO).
+        # self.nelec comes from build_basis -> valence electrons when minimal_BS.
+        E, C = self.diag()
+        nocc = int(round(self.nelec)) // 2
+        return 2.0 * np.sum(E[:nocc])
+
+    def density_matrix(self):
+        E,C = self.diag()
+        P = 0
+        pass
