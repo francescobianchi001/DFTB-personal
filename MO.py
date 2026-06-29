@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Visualise the molecular orbitals coming out of the DFTB Hamiltonian.
 
 For each MO k the wavefunction is rebuilt in real space from the eigenvectors,
@@ -192,15 +192,15 @@ if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser(
         description='Visualise the DFTB molecular orbitals of whatever pair is in ATOMS_BS.')
-    ap.add_argument('d', type=float, nargs='?', default=2.28,
-                    help='bond length in bohr (default 2.28)')
-    ap.add_argument('--ang', action='store_true', help='interpret d as Angstrom instead of bohr')
+    ap.add_argument('d', type=float, nargs='?', default=1.0,
+                    help='bond length in Angstrom (default 1.0, a generic value)')
+    ap.add_argument('--bohr', action='store_true', help='interpret d as bohr instead of Angstrom')
     ap.add_argument('--full', action='store_true', help='full basis (default: minimal valence)')
     ap.add_argument('--mpl', action='store_true', help='matplotlib 3D instead of pyvista')
     ap.add_argument('--2d', dest='twod', action='store_true', help='2D slices instead of 3D')
     args = ap.parse_args()
 
-    d = args.d * 1.8897259886 if args.ang else args.d     # Angstrom -> bohr
+    d = args.d if args.bohr else args.d * 1.8897259886    # Angstrom -> bohr (internal unit)
     viz = MOViz(distance=d, minimal_BS=not args.full)
     viz.print_levels()
     if args.twod:

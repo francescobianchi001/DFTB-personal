@@ -7,6 +7,12 @@ from scipy.integrate import simpson
 import subprocess as sub
 from collections import namedtuple
 
+# The real spherical harmonics / SK angular weights are generated once into
+# Y_real.py. Regenerate only if it is missing (the expressions never change),
+# before anything imports it. Doing this at module load keeps every run quiet.
+if not Path("Y_real.py").exists():
+    sub.run(["SK/./Spherical_Harmonics.py"])
+
 # One basis function (atomic orbital). Its position in the flat basis list is
 # its row/column index in H and S, so no separate index map is needed.
 AO = namedtuple('AO', 'atom n l m u grid')
@@ -143,7 +149,8 @@ class H:
         self.H[mu, nu]   = self.H[nu, mu]   = eps_a * S_SK + Vint
 
     def H_matrix(self):
-        sub.run(["SK/./Spherical_Harmonics.py"])
+        if not Path("Y_real.py").exists():            # cache: generate only once
+            sub.run(["SK/./Spherical_Harmonics.py"])
         self.X,self.Z = self.build_grid(self.distance)
 
         self.build_basis()
@@ -183,11 +190,13 @@ class H:
         return 2.0 * np.sum(E[:nocc])
 
     def density_matrix(self):
-        # One-particle density matrix in the (non-orthogonal) AO basis:
-        #   P_uv = 2 * sum_i^occ  C_ui C_vi   (closed shell).
-        # Check: trace(P @ S) = number of electrons.
         E, C = self.diag()
         nocc = int(round(self.nelec)) // 2
         Cocc = C[:, :nocc]
         P = 2.0 * Cocc @ Cocc.T
         return P
+
+    def Mulliken_charge(self):
+        pass 
+
+
