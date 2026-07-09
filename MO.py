@@ -7,6 +7,7 @@ each AO centred on its atom, and drawn as a signed amplitude in a 2D plane.
 The radial part R = u/r comes from the basis; the angular part Y is taken
 straight from Y_real.harmonics. Run directly to pop the full MO gallery.
 """
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from Hamiltonian import H
@@ -16,8 +17,8 @@ HA = 27.21138
 
 
 class MOViz:
-    def __init__(self, distance, minimal_BS=True):
-        self.mol = H(distance, minimal_BS=minimal_BS)
+    def __init__(self, distance, frozen_core=True):
+        self.mol = H(distance, frozen_core=frozen_core)
         self.mol.H_matrix()
         self.E, self.C = self.mol.diag()
         self.basis = self.mol.basis
@@ -156,6 +157,15 @@ class MOViz:
         else:
             print("(all orbitals occupied — no virtual/LUMO)\n")
 
+    def print_charges(self):
+        Dq = self.mol.Mulliken_charge()
+        print(f"\n{'-'.join(self.mol.names)}  Mulliken charges  (d = {self.distance:.3f} bohr)")
+        print(f"{'atom':>6} {'q_net':>10}")
+        print('-' * 18)
+        for a, name in enumerate(self.mol.names):
+            print(f"{name:>6} {Dq[a]:>+10.5f}")
+        print(f"{'sum':>6} {sum(Dq):>+10.2e}\n")
+
     def plot3d_pyvista(self, which='all', npts=80, half=4.0, iso_frac=0.18):
         """Smooth, GPU (VTK) isosurfaces — one subplot per MO, linked cameras."""
         import pyvista as pv
@@ -198,11 +208,15 @@ if __name__ == '__main__':
     ap.add_argument('--full', action='store_true', help='full basis (default: minimal valence)')
     ap.add_argument('--mpl', action='store_true', help='matplotlib 3D instead of pyvista')
     ap.add_argument('--2d', dest='twod', action='store_true', help='2D slices instead of 3D')
+    ap.add_argument('--mulliken', action='store_true', help='print Mulliken charges and exit')
     args = ap.parse_args()
 
     d = args.d if args.bohr else args.d * 1.8897259886    # Angstrom -> bohr (internal unit)
-    viz = MOViz(distance=d, minimal_BS=not args.full)
+    viz = MOViz(distance=d, frozen_core=not args.full)
     viz.print_levels()
+    if args.mulliken:
+        viz.print_charges()
+        sys.exit(0)
     if args.twod:
         plt.switch_backend('TkAgg'); viz.plot(which='all')
         print('WINDOW_READY', flush=True); plt.show()

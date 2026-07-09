@@ -20,7 +20,7 @@ AO = namedtuple('AO', 'atom n l m u grid')
 
 class H:
 
-    def __init__(self,distance,minimal_BS=True,grid=None):
+    def __init__(self,distance,frozen_core=True,grid=None):
 
         p_bs = Path.cwd()/'ATOMS_BS'
         p_pot = Path.cwd()/'ATOMS_POT'
@@ -68,7 +68,7 @@ class H:
 
         self.p = Path.cwd()
         self.distance = distance
-        self.minimal_BS = minimal_BS
+        self.frozen_core = frozen_core
 
     def SK_int_parametre(self, distance):
 
@@ -94,16 +94,23 @@ class H:
         return X,Z
 
     def build_basis(self):
+        LMAX = 2                                              # SK integrals stop at d
         self.basis = []
-        self.nelec = 0                                       # electrons in the kept basis
+        self.nelec = 0
         for a in range(len(self.basisets)):
-            shells = ([len(self.basisets[a]) - 1] if self.minimal_BS
-                      else range(len(self.basisets[a])))
+            if self.frozen_core:
+                val = max(n for n in range(len(self.basisets[a]))
+                          if any(self.occupied[a][n]))
+                shells = range(val, len(self.basisets[a]))
+            else:
+                shells = range(len(self.basisets[a]))
             for n in shells:
                 for l in range(len(self.basisets[a][n])):
-                    self.nelec += self.occupied[a][n][l]     # valence electrons when minimal_BS
-                    u = np.asarray(self.basisets[a][n][l])   # confined radial (basis shape)
-                    for m in range(-l, l + 1):               # l=0 -> just m=0
+                    if l > LMAX:
+                        continue
+                    self.nelec += self.occupied[a][n][l]
+                    u = np.asarray(self.basisets[a][n][l])
+                    for m in range(-l, l + 1):
                         self.basis.append(AO(a, n, l, m, u, self.r[a]))
         self.N = len(self.basis)
         return self.N
@@ -181,6 +188,8 @@ class H:
 
         assert np.allclose(C.T @ S @ C, np.eye(C.shape[1]), atol=1e-8)
         assert np.allclose(H @ C, S @ C @ np.diag(E), atol=1e-6)
+        
+        self.S= S
 
         return E, C
 
@@ -197,6 +206,15 @@ class H:
         return P
 
     def Mulliken_charge(self):
-        pass 
+        P = self.density_matrix()
+        gross = np.diag(P @ self.S)
+        natoms = len(self.occupied)
+        q = np.zeros(natoms)
+        for mu, ao in enumerate(self.basis):
+            q[ao.atom] += gross[mu]
+        Z = np.zeros(natoms)
+        for atom, n, l in {(ao.atom, ao.n, ao.l) for ao in self.basis}:
+            Z[atom] += self.occupied[atom][n][l]
+        return [Z[a] - q[a] for a in range(natoms)]
 
 
