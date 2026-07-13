@@ -136,10 +136,6 @@ class H:
                         f"not normalized: <phi|phi>={norm}")
                 if A.l == 2:
                     # VO d-shell on-site: Rayleigh quotient of the CONFINED
-                    # orbital against the FREE hamiltonian. Sits between eigN
-                    # (variational min -> too deep) and the confined eps (wall
-                    # energy included -> too high). 1D radial integral, u
-                    # normalised as <u|u>=1. Kinetic by parts (u=0 at both ends
                     # kills the boundary term); Vphys = Veff - wall.
                     r, u = A.grid, A.u
                     # Veff (saved) = physical + valence Vconf, so physical = Veff - Vconf
@@ -175,18 +171,27 @@ class H:
         rA = np.sqrt(X**2 + Z**2)
         rB = np.sqrt(X**2 + (Z - d)**2)
 
-        # Vconf_A must be the wall orbital A was actually solved in (eps_a below
-        # is A's eigenvalue in that potential): the VO wall for a re-confined
-        # virtual, the valence wall otherwise. Vconf_B just turns the confined
-        # Veff_B back into atom B's physical potential -> always the valence wall.
+        # Symmetric two-center H. The eps*S trick eliminates the kinetic energy
+        # via EITHER atom's confined eigen-equation, giving two exact but
+        # numerically different forms. Using only A's breaks the A<->B
+        # permutation symmetry (eps_a*S != eps_b*S when the two orbitals differ,
+        # worst for the diffuse d whose VO-confined eps is far from the rest),
+        # leaking spurious Mulliken charge onto homonuclear atoms. Average both:
+        #   H_ab = 1/2 (eps_a+eps_b) S + 1/2 <a| Va_phys+Vb_phys - Wa - Wb |b>
+        # W_X = wall X was solved in (VO for a re-confined virtual, valence
+        # otherwise); Vx_phys = Veff_X - Vconf_X (valence) is the physical potential.
         wall_A = self.Vconf[A.atom]
         if (A.n, A.l) in self.vo_shells[A.atom] and self.Vconf_VO[A.atom] is not None:
             wall_A = self.Vconf_VO[A.atom]
+        wall_B = self.Vconf[B.atom]
+        if (B.n, B.l) in self.vo_shells[B.atom] and self.Vconf_VO[B.atom] is not None:
+            wall_B = self.Vconf_VO[B.atom]
 
-        Veff_B  = np.interp(rB.ravel(), B.grid, self.Veff[B.atom],  right=0.0).reshape(rB.shape)
-        Vconf_B = np.interp(rB.ravel(), B.grid, self.Vconf[B.atom], right=0.0).reshape(rB.shape)
-        Vconf_A = np.interp(rA.ravel(), A.grid, wall_A,             right=0.0).reshape(rA.shape)
-        VJ = Veff_B - Vconf_B - Vconf_A
+        VA_phys = np.interp(rA.ravel(), A.grid, self.Veff[A.atom] - self.Vconf[A.atom], right=0.0).reshape(rA.shape)
+        VB_phys = np.interp(rB.ravel(), B.grid, self.Veff[B.atom] - self.Vconf[B.atom], right=0.0).reshape(rB.shape)
+        W_A     = np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
+        W_B     = np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)
+        VJ = 0.5 * (VA_phys + VB_phys - W_A - W_B)
 
         RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
         RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
@@ -197,8 +202,9 @@ class H:
         Vint = simpson(simpson(base * VJ, x=self.x, axis=0), x=self.z)
 
         eps_a = self.eigenvalues[A.atom][A.n][A.l]             # confined eps for the eps*S trick
+        eps_b = self.eigenvalues[B.atom][B.n][B.l]
         self.Sij[mu, nu] = self.Sij[nu, mu] = S_SK
-        self.H[mu, nu]   = self.H[nu, mu]   = eps_a * S_SK + Vint
+        self.H[mu, nu]   = self.H[nu, mu]   = 0.5 * (eps_a + eps_b) * S_SK + Vint
 
     def H_matrix(self):
         if not Path("Y_real.py").exists():            # cache: generate only once
