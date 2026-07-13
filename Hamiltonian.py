@@ -49,6 +49,12 @@ class H:
         self.eigenvalues = [data['eigenvalues'].tolist() for data in atoms]
         self.Veff = [data['Veff'] for data in V]
         self.Vconf = [data['Vconf']  for data in V]
+        # split confinement: virtual shells listed in vo_shells use Vconf_VO
+        # instead of Vconf. Absent (single-wall runs) -> None / empty set.
+        self.Vconf_VO = [data['Vconf_VO'] if 'Vconf_VO' in data.files else None
+                         for data in V]
+        self.vo_shells = [set(map(tuple, data['vo_shells'].tolist()))
+                          if 'vo_shells' in data.files else set() for data in V]
 
         pth = Path.cwd()/'eig_neutral'
 
@@ -108,8 +114,10 @@ class H:
                 for l in range(len(self.basisets[a][n])):
                     if l > LMAX:
                         continue
-                    self.nelec += self.occupied[a][n][l]
                     u = np.asarray(self.basisets[a][n][l])
+                    if not np.any(u):                    # zeroed (VO-keep) / absent shell
+                        continue
+                    self.nelec += self.occupied[a][n][l]
                     for m in range(-l, l + 1):
                         self.basis.append(AO(a, n, l, m, u, self.r[a]))
         self.N = len(self.basis)
@@ -126,6 +134,35 @@ class H:
                     raise ValueError(
                         f"AO {mu} (atom {A.atom}, n{A.n} l{A.l} m{A.m}) "
                         f"not normalized: <phi|phi>={norm}")
+                if A.l == 2:
+                    # VO d-shell on-site: Rayleigh quotient of the CONFINED
+                    # orbital against the FREE hamiltonian. Sits between eigN
+                    # (variational min -> too deep) and the confined eps (wall
+                    # energy included -> too high). 1D radial integral, u
+                    # normalised as <u|u>=1. Kinetic by parts (u=0 at both ends
+                    # kills the boundary term); Vphys = Veff - wall.
+                    r, u = A.grid, A.u
+                    # Veff (saved) = physical + valence Vconf, so physical = Veff - Vconf
+                    # regardless of which wall this VO orbital was solved in.
+                    Vphys = self.Veff[A.atom] - self.Vconf[A.atom]
+                    up = np.gradient(u, r)
+                    centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
+                    E_ray = simpson(0.5 * up**2 + (centrifugal + Vphys) * u**2, x=r)
+                    # bracket check: neutral level (too deep) < Rayleigh < confined eps (too high)
+                    eig_neutral = self.eigN[A.atom][A.n][A.l]
+                    eps_conf    = self.eigenvalues[A.atom][A.n][A.l]
+                    if A.m == -A.l:
+                        print(f"[VO d bracket] atom {A.atom} ({self.names[A.atom]}) "
+                              f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f} < "
+                              f"E_ray={E_ray:+.6f} < eps_conf={eps_conf:+.6f}")
+                    if not (eig_neutral <= E_ray <= eps_conf):
+                        print(f"WARNING: VO d Rayleigh out of bracket for atom {A.atom} "
+                              f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f}, E_ray={E_ray:+.6f}, "
+                              f"eps_conf={eps_conf:+.6f}")
+                    self.Sij[mu, mu] = 1.0
+                    self.H[mu, mu]   = E_ray
+                    return
+
                 self.Sij[mu, mu] = 1.0
                 self.H[mu, mu]   = self.eigN[A.atom][A.n][A.l]   # neutral on-site level
             return                                              # off-diag same-atom = 0
@@ -138,9 +175,17 @@ class H:
         rA = np.sqrt(X**2 + Z**2)
         rB = np.sqrt(X**2 + (Z - d)**2)
 
+        # Vconf_A must be the wall orbital A was actually solved in (eps_a below
+        # is A's eigenvalue in that potential): the VO wall for a re-confined
+        # virtual, the valence wall otherwise. Vconf_B just turns the confined
+        # Veff_B back into atom B's physical potential -> always the valence wall.
+        wall_A = self.Vconf[A.atom]
+        if (A.n, A.l) in self.vo_shells[A.atom] and self.Vconf_VO[A.atom] is not None:
+            wall_A = self.Vconf_VO[A.atom]
+
         Veff_B  = np.interp(rB.ravel(), B.grid, self.Veff[B.atom],  right=0.0).reshape(rB.shape)
         Vconf_B = np.interp(rB.ravel(), B.grid, self.Vconf[B.atom], right=0.0).reshape(rB.shape)
-        Vconf_A = np.interp(rA.ravel(), A.grid, self.Vconf[A.atom], right=0.0).reshape(rA.shape)
+        Vconf_A = np.interp(rA.ravel(), A.grid, wall_A,             right=0.0).reshape(rA.shape)
         VJ = Veff_B - Vconf_B - Vconf_A
 
         RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
