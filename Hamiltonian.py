@@ -92,10 +92,11 @@ class H:
     def build_grid(self,d_AB,N=400):
         rmax = self.r[0][-1]
         r0 = self.r[0][0]
-        zmin = r0- rmax
-        zmax= r0 + rmax + d_AB
         self.x = np.linspace(r0,rmax,N)
-        self.z = np.linspace(zmin,zmax,N)
+        # z symmetric about the bond midpoint d/2 so the reflection z -> d-z maps
+        # the node set onto itself (needed for the Vint reflection-averaging in
+        # fill_element to be exact).
+        self.z = np.linspace(-rmax, d_AB + rmax, N)
         X,Z = np.meshgrid(self.x,self.z,indexing='ij')
         return X,Z
 
@@ -170,9 +171,7 @@ class H:
             return                                              # -> 0 by symmetry
         o = abs(A.m)                                            # sigma/pi/delta channel
         d = self.distance
-        X, Z = self.X, self.Z
-        rA = np.sqrt(X**2 + Z**2)
-        rB = np.sqrt(X**2 + (Z - d)**2)
+        X = self.X
 
         # Symmetric two-center H. The eps*S trick eliminates the kinetic energy
         # via EITHER atom's confined eigen-equation, giving two exact but
@@ -189,20 +188,32 @@ class H:
         wall_B = self.Vconf[B.atom]
         if (B.n, B.l) in self.vo_shells[B.atom] and self.Vconf_VO[B.atom] is not None:
             wall_B = self.Vconf_VO[B.atom]
-
-        VA_phys = np.interp(rA.ravel(), A.grid, self.Veff[A.atom] - self.Vconf[A.atom], right=0.0).reshape(rA.shape)
-        VB_phys = np.interp(rB.ravel(), B.grid, self.Veff[B.atom] - self.Vconf[B.atom], right=0.0).reshape(rB.shape)
-        W_A     = np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
-        W_B     = np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)
-        VJ = 0.5 * (VA_phys + VB_phys - W_A - W_B)
-
-        RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
-        RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
+        VphysA = self.Veff[A.atom] - self.Vconf[A.atom]
+        VphysB = self.Veff[B.atom] - self.Vconf[B.atom]
         AW = Y_real.angular_weights[(A.l, B.l, o)]
 
-        base = RA * RB * AW(X, Z, d) * self.X                  # self.X = rho Jacobian
-        S_SK = simpson(simpson(base,      x=self.x, axis=0), x=self.z)
-        Vint = simpson(simpson(base * VJ, x=self.x, axis=0), x=self.z)
+        # S_SK and Vint integrands, sampled at bond-axis coordinate Zc.
+        def integrand(Zc):
+            rA = np.sqrt(X**2 + Zc**2)
+            rB = np.sqrt(X**2 + (Zc - d)**2)
+            RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
+            RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
+            VJ = 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
+                        + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
+                        - np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
+                        - np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape))
+            b = RA * RB * AW(X, Zc, d) * X                     # X = rho Jacobian
+            return b, b * VJ
+
+        # Reflection-average over z -> d-z. Analytically the integral is invariant
+        # (the substitution swaps A<->B); numerically it symmetrizes the quadrature
+        # so the potential-weighted Vint is A<->B symmetric, not just S.
+        bS1, bV1 = integrand(self.Z)
+        bS2, bV2 = integrand(d - self.Z)
+        baseS = 0.5 * (bS1 + bS2)
+        baseV = 0.5 * (bV1 + bV2)
+        S_SK = simpson(simpson(baseS, x=self.x, axis=0), x=self.z)
+        Vint = simpson(simpson(baseV, x=self.x, axis=0), x=self.z)
 
         eps_a = self.eigenvalues[A.atom][A.n][A.l]             # confined eps for the eps*S trick
         eps_b = self.eigenvalues[B.atom][B.n][B.l]
