@@ -134,12 +134,15 @@ class H:
                     raise ValueError(
                         f"AO {mu} (atom {A.atom}, n{A.n} l{A.l} m{A.m}) "
                         f"not normalized: <phi|phi>={norm}")
-                if A.l == 2:
-                    # VO d-shell on-site: Rayleigh quotient of the CONFINED
-                    # kills the boundary term); Vphys = Veff - wall.
+                if (A.n, A.l) in self.vo_shells[A.atom]:
+                    # VO on-site (any s/p/d virtual, NOT the valence): Rayleigh
+                    # quotient of the CONFINED orbital against the FREE hamiltonian.
+                    # Sits between eigN (variational min -> too deep) and the
+                    # confined eps (wall energy -> too high). 1D radial integral,
+                    # <u|u>=1; kinetic by parts (u=0 at both ends kills the
+                    # boundary term). Veff (saved) = physical + valence Vconf, so
+                    # physical = Veff - Vconf regardless of this orbital's own wall.
                     r, u = A.grid, A.u
-                    # Veff (saved) = physical + valence Vconf, so physical = Veff - Vconf
-                    # regardless of which wall this VO orbital was solved in.
                     Vphys = self.Veff[A.atom] - self.Vconf[A.atom]
                     up = np.gradient(u, r)
                     centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
@@ -148,11 +151,11 @@ class H:
                     eig_neutral = self.eigN[A.atom][A.n][A.l]
                     eps_conf    = self.eigenvalues[A.atom][A.n][A.l]
                     if A.m == -A.l:
-                        print(f"[VO d bracket] atom {A.atom} ({self.names[A.atom]}) "
+                        print(f"[VO bracket] atom {A.atom} ({self.names[A.atom]}) "
                               f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f} < "
                               f"E_ray={E_ray:+.6f} < eps_conf={eps_conf:+.6f}")
                     if not (eig_neutral <= E_ray <= eps_conf):
-                        print(f"WARNING: VO d Rayleigh out of bracket for atom {A.atom} "
+                        print(f"WARNING: VO Rayleigh out of bracket for atom {A.atom} "
                               f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f}, E_ray={E_ray:+.6f}, "
                               f"eps_conf={eps_conf:+.6f}")
                     self.Sij[mu, mu] = 1.0
