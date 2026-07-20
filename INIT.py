@@ -45,6 +45,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--VO", type=int, default=None, metavar="N",
                     help="add N virtual shells to both solves (DFTB polarization basis)")
+    ap.add_argument("--r0-VO", dest="r0_VO", type=float, default=None, metavar="R0",
+                    help="weaker confinement radius (bohr) for the --VO virtual shells; "
+                         "triggers the split-confinement solve (writes vo_shells/Vconf_VO)")
     ap.add_argument("--lb94", dest="lb94", action="store_true", default=None,
                     help="force LB94 on the free-atom (diagonal) solve")
     ap.add_argument("--no-lb94", dest="lb94", action="store_false",
@@ -65,12 +68,16 @@ def main():
         d.mkdir()
 
     vo = ["--VO", str(args.VO)] if args.VO is not None else []
-    print(f"VO={args.VO}  LB94(free)={lb94}  atoms={list(ATOMS)}")
+    # r0_VO (split confinement) applies only to the confined basis solve, not the
+    # free-atom diagonal (which has no wall). It writes vo_shells/Vconf_VO so the
+    # DFTB Hamiltonian uses the Rayleigh on-site + VO-wall off-diagonal for virtuals.
+    r0vo = ["--r0-VO", str(args.r0_VO)] if args.r0_VO is not None else []
+    print(f"VO={args.VO}  r0_VO={args.r0_VO}  LB94(free)={lb94}  atoms={list(ATOMS)}")
 
     for atom, Z in ATOMS.items():
         print(f"[{atom}] Z={Z}")
         # Confined pseudo-atom: basis shapes + confined eigenvalues + Veff/Vconf.
-        run([str(Z), "--pseudoatom", "--exp-grid", *vo,
+        run([str(Z), "--pseudoatom", "--exp-grid", *vo, *r0vo,
              "--save", str(WFDIR / atom),
              "--save_V", str(POTDIR / atom)])
         # Free neutral atom: physical (negative) on-site levels for the diagonal.

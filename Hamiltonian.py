@@ -16,7 +16,7 @@ from read_xyz import get_coords, ATOM_NAMES
 if not Path("Y_real.py").exists():
     sub.run(["SK/./Spherical_Harmonics.py"])
 
-def prepare_atoms(geom, vo=None, lb94=None):
+def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None):
     """Make sure the per-atom .npz data for every element in `geom` exists.
 
     Reads the geometry, maps each atomic number to its element symbol (via
@@ -30,6 +30,10 @@ def prepare_atoms(geom, vo=None, lb94=None):
       lb94 : True  -> force the LB94 -1/r tail on the free-atom solve (--lb94)
              False -> disable it (--no-lb94)
              None  -> let INIT decide (LB94 defaults on iff vo is set).
+      r0_vo: float or None -- weaker confinement radius (bohr) for the virtual
+             shells (--r0-VO). Triggers the split-confinement solve that writes
+             vo_shells/Vconf_VO, activating the Rayleigh on-site + VO-wall
+             off-diagonal treatment. Needs vo to be set to have any effect.
     """
     atno, coords = get_coords(geom, maxlen=100)
     # unique elements in the geometry, Z -> capitalized symbol ("cl" -> "Cl")
@@ -60,6 +64,8 @@ def prepare_atoms(geom, vo=None, lb94=None):
         extra.append('--lb94')
     elif lb94 is False:
         extra.append('--no-lb94')
+    if r0_vo is not None:
+        extra += ['--r0-VO', str(r0_vo)]
 
     sub.run([sys.executable, str(init_path), *extra], check=True)
     return atoms
@@ -72,12 +78,12 @@ AO = namedtuple('AO', 'atom elem n l m u grid d')
 class H:
 
     def __init__(self,distance,frozen_core=True,grid=None,geom='geometry.xyz',
-                 vo=None,lb94=None):
+                 vo=None,lb94=None,r0_vo=None):
 
         # Make sure every element in the geometry has its .npz data on disk
         # (runs INIT.py only if something is missing), then read the geometry.
-        # vo / lb94 choose how those files are generated (see prepare_atoms).
-        prepare_atoms(geom, vo=vo, lb94=lb94)
+        # vo / lb94 / r0_vo choose how those files are generated (see prepare_atoms).
+        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo)
         atom,coords = get_coords(geom, maxlen=100)
 
         p_bs = Path.cwd()/'ATOMS_BS'
