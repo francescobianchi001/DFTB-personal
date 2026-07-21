@@ -16,7 +16,7 @@ from read_xyz import get_coords, ATOM_NAMES
 if not Path("Y_real.py").exists():
     sub.run(["SK/./Spherical_Harmonics.py"])
 
-def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None):
+def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     """Make sure the per-atom .npz data for every element in `geom` exists.
 
     Reads the geometry, maps each atomic number to its element symbol (via
@@ -66,6 +66,8 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None):
         extra.append('--no-lb94')
     if r0_vo is not None:
         extra += ['--r0-VO', str(r0_vo)]
+    if r0 is not None:
+        extra += ['--r0', str(r0)]
 
     sub.run([sys.executable, str(init_path), *extra], check=True)
     return atoms
@@ -78,12 +80,12 @@ AO = namedtuple('AO', 'atom elem n l m u grid d')
 class H:
 
     def __init__(self,distance,frozen_core=True,grid=None,geom='geometry.xyz',
-                 vo=None,lb94=None,r0_vo=None):
+                 vo=None,lb94=None,r0_vo=None,r0=None):
 
         # Make sure every element in the geometry has its .npz data on disk
         # (runs INIT.py only if something is missing), then read the geometry.
-        # vo / lb94 / r0_vo choose how those files are generated (see prepare_atoms).
-        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo)
+        # vo / lb94 / r0_vo / r0 choose how those files are generated (see prepare_atoms).
+        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo, r0=r0)
         atom,coords = get_coords(geom, maxlen=100)
 
         p_bs = Path.cwd()/'ATOMS_BS'
