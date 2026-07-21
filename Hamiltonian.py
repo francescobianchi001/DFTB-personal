@@ -79,7 +79,7 @@ AO = namedtuple('AO', 'atom elem n l m u grid d')
 
 class H:
 
-    def __init__(self,distance,frozen_core=True,grid=None,geom='geometry.xyz',
+    def __init__(self,distance=None,frozen_core=True,grid=None,geom='geometry.xyz',
                  vo=None,lb94=None,r0_vo=None,r0=None):
 
         # Make sure every element in the geometry has its .npz data on disk
@@ -309,8 +309,9 @@ class H:
         if not Path("Y_real.py").exists():            # cache: generate only once
             sub.run(["SK/./Spherical_Harmonics.py"])
         self.space()                                   # basis + distance matrix + center
-        d_bond = self.dist[0, 1]                        # diatomic: the single bond length
-        self.X, self.Z = self.build_grid(d_bond)
+        # the two-center grid runs along the pair axis (A at 0, B at d), so it has
+        # to reach the FURTHEST pair, not just the first bond.
+        self.X, self.Z = self.build_grid(self.dist.max())
         self.H   = np.zeros((self.N, self.N))
         self.Sij = np.zeros((self.N, self.N))
 
