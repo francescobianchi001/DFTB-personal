@@ -10,11 +10,17 @@ import subprocess as sub
 from collections import namedtuple
 from read_xyz import get_coords, ATOM_NAMES
 
-# The real spherical harmonics / SK angular weights are generated once into
-# Y_real.py. Regenerate only if it is missing (the expressions never change),
-# before anything imports it. Doing this at module load keeps every run quiet.
-if not Path("Y_real.py").exists():
-    sub.run(["SK/./Spherical_Harmonics.py"])
+# The real spherical harmonics, the SK angular weights and the SK rotation table
+# (bond direction cosines -> combination of V_{l l' m}) are all generated once
+# into Y_real.py. Regenerate only if it is missing or predates one of those
+# blocks -- the expressions themselves never change -- before anything imports
+# it. Doing this at module load keeps every run quiet.
+def ensure_Y_real(path=Path("Y_real.py")):
+    if path.exists() and 'rotations' in path.read_text():
+        return
+    sub.run(["SK/./Spherical_Harmonics.py"], check=True)
+
+ensure_Y_real()
 
 def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     """Make sure the per-atom .npz data for every element in `geom` exists.
@@ -136,6 +142,7 @@ class H:
             if entry.is_file():
                 eig_neutral.append(np.load(entry,allow_pickle=True))
         self.eigN = [data['eigenvalues'].tolist() for data in eig_neutral]
+        self.Vneutral = [data['Veff'] for data in eig_neutral]
 
         if grid!=None:
             self.r = self.r[:grid]
@@ -275,6 +282,8 @@ class H:
             wall_B = self.Vconf_VO[B.elem]
         VphysA = self.Veff[A.elem] - self.Vconf[A.elem]
         VphysB = self.Veff[B.elem] - self.Vconf[B.elem]
+        Vn_A = self.Vneutral[A.elem]
+        Vn_B = self.Vneutral[B.elem]
         AW = Y_real.angular_weights[(A.l, B.l, o)]
 
         # S_SK and Vint integrands, sampled at bond-axis coordinate Zc.
@@ -283,10 +292,12 @@ class H:
             rB = np.sqrt(X**2 + (Zc - d)**2)
             RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
             RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
-            VJ = 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
-                        + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
-                        - np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
-                        - np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape))
+            VJ = (np.interp(rA.ravel(), A.grid, Vn_A, right=0.0).reshape(rA.shape)
+                  + np.interp(rB.ravel(), B.grid, Vn_B, right=0.0).reshape(rB.shape)
+                  - 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
+                           + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
+                           + np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
+                           + np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)))
             b = RA * RB * AW(X, Zc, d) * X # X = rho Jacobian
             return b, b * VJ
 
@@ -306,8 +317,7 @@ class H:
         self.H[mu, nu]   = self.H[nu, mu]   = 0.5 * (eps_a + eps_b) * S_SK + Vint
 
     def H_matrix(self):
-        if not Path("Y_real.py").exists():            # cache: generate only once
-            sub.run(["SK/./Spherical_Harmonics.py"])
+        ensure_Y_real()                                # cache: generate only once
         self.space()                                   # basis + distance matrix + center
         # the two-center grid runs along the pair axis (A at 0, B at d), so it has
         # to reach the FURTHEST pair, not just the first bond.
