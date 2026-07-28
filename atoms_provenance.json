@@ -1,0 +1,14 @@
+{
+  "settings": {
+    "VO": null,
+    "r0": null,
+    "r0_VO": null,
+    "lb94": false
+  },
+  "elements": [
+    "C",
+    "H",
+    "N",
+    "O"
+  ]
+}

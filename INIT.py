@@ -15,6 +15,7 @@ with the LB94 -1/r tail, so --VO turns LB94 on for the free solve unless
 --no-lb94 is given. The confined solve stays plain LDA (off-diagonal recipe).
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ from pathlib import Path
 # atom label -> atomic number Z. Edit to change the system (default: He dimer).
 ATOMS = {
     "C": 6,
+    "H": 1,
+    "N": 7,
     "O": 8,
 }
 
@@ -32,6 +35,26 @@ PLOTTER = ROOT.parent / "DFT" / "allplotter.py"
 WFDIR = ROOT / "ATOMS_BS"
 POTDIR = ROOT / "ATOMS_POT"
 EIGDIR = ROOT / "eig_neutral"
+# Records WHICH settings the stored atoms were solved with, so a later run can
+# tell "add a new element" (same level of theory -> keep the rest) apart from
+# "the method changed" (-> everything on disk is stale and must be redone).
+MANIFEST = ROOT / "atoms_provenance.json"
+
+
+def resolve_lb94(lb94, vo):
+    """LB94 defaults on for the free solve whenever VO is requested (virtuals
+    need the -1/r tail to bind); off otherwise. Explicit flags override.
+    prepare_atoms in Hamiltonian.py duplicates this rule -- keep them in step."""
+    return bool(lb94) if lb94 is not None else (vo is not None)
+
+
+def read_manifest():
+    if not MANIFEST.exists():
+        return None
+    try:
+        return json.loads(MANIFEST.read_text())
+    except (ValueError, OSError):
+        return None
 
 
 def run(extra):
@@ -55,20 +78,32 @@ def main():
                     help="force LB94 on the free-atom (diagonal) solve")
     ap.add_argument("--no-lb94", dest="lb94", action="store_false",
                     help="disable LB94 even when --VO is set")
+    ap.add_argument("--fresh", action="store_true",
+                    help="wipe ATOMS_BS/ATOMS_POT/eig_neutral and redo every element "
+                         "(implied when the requested settings differ from the stored "
+                         "ones -- a change of method invalidates all of them)")
     args = ap.parse_args()
 
-    # LB94 defaults on for the free solve whenever VO is requested (virtuals need
-    # the -1/r tail to bind); off otherwise. --lb94/--no-lb94 override explicitly.
-    lb94 = args.lb94 if args.lb94 is not None else (args.VO is not None)
+    lb94 = resolve_lb94(args.lb94, args.VO)
+    settings = {"VO": args.VO, "r0": args.r0, "r0_VO": args.r0_VO, "lb94": lb94}
 
     if not PLOTTER.exists():
         sys.exit(f"solver not found: {PLOTTER}")
 
     os.environ["MPLBACKEND"] = "Agg"   # headless: plt.show() must not block
 
+    prov = read_manifest()
+    stale = prov is not None and prov.get("settings") != settings
+    if stale:
+        print(f"settings changed {prov.get('settings')} -> {settings}; "
+              f"rebuilding every element")
+    fresh = args.fresh or stale
+
+    if fresh:
+        for d in (WFDIR, POTDIR, EIGDIR):
+            shutil.rmtree(d, ignore_errors=True)
     for d in (WFDIR, POTDIR, EIGDIR):
-        shutil.rmtree(d, ignore_errors=True)
-        d.mkdir()
+        d.mkdir(exist_ok=True)
 
     vo = ["--VO", str(args.VO)] if args.VO is not None else []
     # r0_VO (split confinement) applies only to the confined basis solve, not the
@@ -78,9 +113,16 @@ def main():
     # r0 override tunes the valence confinement (off-diagonal/bonding); it applies
     # only to the confined solve, not the free-atom diagonal (which has no wall).
     r0 = ["--r0", str(args.r0)] if args.r0 is not None else []
-    print(f"VO={args.VO}  r0={args.r0}  r0_VO={args.r0_VO}  LB94(free)={lb94}  atoms={list(ATOMS)}")
+    # Only the elements that are actually missing: same settings means whatever
+    # is already on disk was solved at this level of theory and can be kept.
+    todo = {a: Z for a, Z in ATOMS.items()
+            if not (WFDIR / f"{a}.npz").exists()}
+    keep = [a for a in ATOMS if a not in todo]
+    print(f"VO={args.VO}  r0={args.r0}  r0_VO={args.r0_VO}  LB94(free)={lb94}")
+    print(f"  solve: {list(todo) or '(nothing)'}"
+          + (f"   keep (already at these settings): {keep}" if keep else ""))
 
-    for atom, Z in ATOMS.items():
+    for atom, Z in todo.items():
         print(f"[{atom}] Z={Z}")
         # Confined pseudo-atom: basis shapes + confined eigenvalues + Veff/Vconf.
         run([str(Z), "--pseudoatom", "--exp-grid", *vo, *r0, *r0vo,
@@ -92,6 +134,11 @@ def main():
             free.append("--LB94")
         run(free)
 
+    # Record the settings plus everything now on disk, so the next run can tell
+    # "new element at the same level" from "method changed, all of it is stale".
+    MANIFEST.write_text(json.dumps(
+        {"settings": settings,
+         "elements": sorted(p.stem for p in WFDIR.glob("*.npz"))}, indent=2))
     print("Done.")
 
 

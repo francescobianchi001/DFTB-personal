@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import json
 import numpy as np
 import re
 import sys
@@ -46,19 +47,46 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     atoms = {ATOM_NAMES[int(Z)].capitalize(): int(Z) for Z in atno}
 
     p_bs = Path.cwd() / 'ATOMS_BS'
-    missing = [sym for sym in atoms if not (p_bs / f'{sym}.npz').exists()]
-    if not missing:
+    manifest = Path.cwd() / 'atoms_provenance.json'
+
+    # Same rule INIT.resolve_lb94 applies -- keep the two in step.
+    want = {'VO': vo, 'r0': r0, 'r0_VO': r0_vo,
+            'lb94': bool(lb94) if lb94 is not None else (vo is not None)}
+
+    prov = None
+    if manifest.exists():
+        try:
+            prov = json.loads(manifest.read_text()).get('settings')
+        except (ValueError, OSError):
+            prov = None
+
+    on_disk = {p.stem for p in p_bs.glob('*.npz')} if p_bs.is_dir() else set()
+    missing = [sym for sym in atoms if sym not in on_disk]
+    stale = prov is not None and prov != want
+
+    if not stale and not missing:
         return atoms
+    if prov is None and on_disk:
+        print(f"prepare_atoms: {sorted(on_disk)} on disk with no provenance record "
+              f"-- assuming they were solved at the requested settings {want}. "
+              f"Delete atoms_provenance.json / the ATOMS_* dirs to force a rebuild.")
+    if stale:
+        print(f"prepare_atoms: stored atoms were solved with {prov}, this run wants "
+              f"{want} -> ALL elements will be recomputed")
+    elif missing:
+        print(f"prepare_atoms: missing basis data for {missing} -> solving just those "
+              f"(keeping {sorted(on_disk)})")
 
-    print(f"prepare_atoms: missing basis data for {missing} -> running INIT.py")
-
-    # Rewrite the ATOMS = { ... } dict in INIT.py so its solve targets exactly
-    # the elements this geometry needs, then run it (INIT wipes and rebuilds
-    # ATOMS_BS / ATOMS_POT / eig_neutral for every element in that dict).
+    # Rewrite the ATOMS = { ... } dict in INIT.py. It must list the UNION of what
+    # is already on disk and what this geometry needs: INIT skips elements it
+    # already has, but on a settings change it rebuilds every element in the
+    # dict, and anything left out of it would be silently lost.
+    keep = {sym: ATOM_NAMES.index(sym.lower()) for sym in on_disk
+            if sym.lower() in ATOM_NAMES}
     init_path = Path.cwd() / 'INIT.py'
     text = init_path.read_text()
     block = 'ATOMS = {\n' + ''.join(
-        f'    "{sym}": {Z},\n' for sym, Z in atoms.items()) + '}'
+        f'    "{sym}": {Z},\n' for sym, Z in sorted({**keep, **atoms}.items())) + '}'
     text = re.sub(r'ATOMS = \{.*?\}', block, text, count=1, flags=re.DOTALL)
     init_path.write_text(text)
 
