@@ -173,21 +173,6 @@ class H:
         return S
 
     def build_grid(self,d,N=400):
-        """Quadrature grid for ONE pair at separation d. Returns the meshes and
-        the 1D node arrays Simpson needs, without touching instance state.
-
-        The z range is tied to d (not to the largest distance in the molecule):
-        at fixed N a bigger span means a coarser dz, and while the overlap is
-        smooth enough not to care, the H integrand's -Z/r cusps are resolved
-        badly enough that stretching the span from a bond length to 30 bohr
-        costs ~0.1 -> ~0.5 eV on individual two-center potential integrals.
-        Gridding per pair keeps every bond at diatomic resolution.
-
-        z stays symmetric about the bond midpoint d/2, which makes the
-        reflection z -> d-z map the node set onto itself. NB the A<->B exchange
-        identity does NOT rely on that: it holds pointwise on the integrand
-        (see cross_terms), so it survives any choice of grid.
-        """
         rmax = self.r[0][-1]
         r0 = self.r[0][0]
         x = np.linspace(r0,rmax,N)
@@ -196,13 +181,6 @@ class H:
         return X,Z,x,z
 
     def _grid(self,d,N=400):
-        """build_grid with the last result remembered.
-
-        fill_cross asks for min(l1,l2)+1 channels per shell pair and they all
-        share a d, so a single remembered grid is hit every time after the
-        first. One slot, not a dict: each grid is ~2.6 MB, and a molecule has
-        far too many pairs to keep them all.
-        """
         if self._gkey != (d, N):
             self._gkey, self._gval = (d, N), self.build_grid(d, N)
         return self._gval
@@ -274,19 +252,6 @@ class H:
             b = RA * RB * AW(X, Zc, d) * X # X = rho Jacobian
             return b, b * VJ
 
-        # Reflection-average over z -> d-z. Analytically the integral is invariant
-        # (z -> d-z is a change of variable, exact for A != B as much as for A == B);
-        # numerically it symmetrizes the quadrature. What it really buys is the
-        # A<->B EXCHANGE identity: pointwise at every node the integrand obeys
-        #   f_AB(d-z) = (-1)^(l1+l2) f_BA(z)
-        # (the radial factors swap, and the angular weight flips because
-        # cos t1|_(d-z) = -cos t2|_z with P_l^m(-u) = (-1)^(l+m) P_l^m(u)), so the
-        # AVERAGED integrand is exactly (-1)^(l1+l2) times the swapped one and
-        #   V_{l1 l2 m}(A->B) = (-1)^(l1+l2) V_{l2 l1 m}(B->A)
-        # holds to the last bit. H_matrix only ever evaluates ONE ordering per pair
-        # (fill_cross gets A = the later atom, since the loop runs nu <= mu), so
-        # without this the answer would depend on the order the atoms happen to be
-        # listed in the xyz file -- 0.14 eV on the CO MO energies when tested.
         bS1, bV1 = integrand(Zg)
         bS2, bV2 = integrand(d - Zg)
         baseS = 0.5 * (bS1 + bS2)
@@ -295,7 +260,78 @@ class H:
         V_o = simpson(simpson(baseV, x=xg, axis=0), x=zg)
         return S_o, V_o
 
-    def fill_diag(self, A, mu):
+    # Use the radial matrix element for the VALENCE diagonal too, making the
+    # whole on-site block refer to one operator (T + V_phys). Off by default:
+    # the eigN diagonal is what the LB94/IP work was validated against, and
+    # swapping it moves every on-site level. Flip it to experiment.
+    ONSITE_CONSISTENT = False
+
+    # How the same-atom off-diagonal H is built (S is always the radial overlap):
+    #   'epsS'   0.5*(H_nn + H_n'n') * S   -- the on-site analogue of the eps*S
+    #            trick fill_cross uses; consistent with the diagonal convention
+    #            whatever it is, and only widens level splittings slightly.
+    #   'radial' <a| T + V_phys |b> directly -- first-principles, but only
+    #            meaningful together with ONSITE_CONSISTENT = True, since
+    #            otherwise the diagonal comes from a different operator.
+    ONSITE_MODE = 'epsS'
+
+    def _radial_S(self, A, B):
+        """<phi_A|phi_B> for two shells on the SAME atom: a 1D radial integral.
+
+        Zero unless (l, m) match -- different l or m are killed by the angular
+        integral, so only same-(l,m) radial pairs survive.
+        """
+        return simpson(A.u * B.u, x=A.grid)
+
+    def _radial_H(self, A, B):
+        """<phi_A| T + V_phys |phi_B> on one atom, same (l, m). 1D radial.
+
+        Kinetic taken by parts (u vanishes at both ends, so no boundary term):
+        <a|T|b> = int [ 1/2 u_a' u_b' + l(l+1)/(2r^2) u_a u_b ] dr.
+        V_phys = Veff - Vconf is the FREE atomic potential: Veff as saved is
+        physical + valence Vconf, whatever wall this particular shell used.
+        A == B reproduces the Rayleigh quotient exactly.
+        """
+        r = A.grid
+        Vphys = self.Veff[A.elem] - self.Vconf[A.elem]
+        centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
+        return simpson(0.5 * np.gradient(A.u, r) * np.gradient(B.u, r)
+                       + (centrifugal + Vphys) * A.u * B.u, x=r)
+
+    def fill_onsite(self, A, B, mu, nu):
+        """Same-atom, DIFFERENT-shell block of H and S.
+
+        Was hardcoded to zero, which is exact only while every shell of an atom
+        comes from the SAME radial Hamiltonian. Split confinement (--r0-VO)
+        breaks that: the virtual shells solve a different equation, so same-l
+        valence<->virtual pairs are genuinely non-orthogonal -- measured 0.117
+        (C 2s-3s) and 0.171 (C 2p-3p). Leaving those at zero makes S stop being
+        the Gram matrix of any set of functions, so nothing guarantees it stays
+        positive definite, and it makes any contraction of two radial functions
+        on one atom ill-defined (the metric is asserted, not computed).
+
+        Only the atom's OWN potential enters here. The neighbours' potential
+        would add a crystal-field term <phi^A|V_B|phi'^A>, which standard DFTB
+        drops with the rest of the three-center terms; not included.
+        """
+        if A.l != B.l or A.m != B.m:                 # orthogonal by the angular part
+            return
+        S_ab = self._radial_S(A, B)
+        if self.ONSITE_MODE == 'radial':
+            H_ab = self._radial_H(A, B)
+        else:
+            # eps*S, the on-site analogue of what fill_cross does off-site (there
+            # is no V_J here: no other atom). Consistent with WHATEVER convention
+            # the diagonal uses, since it reads the diagonal back. Well behaved:
+            # for a 2x2 block it leaves the levels at their mean +- delta/sqrt(1-S^2),
+            # i.e. it only widens the splitting by a few percent, whereas mixing an
+            # eigN diagonal with <a|T+Vphys|b> off it represents no single operator
+            # and threw the cyclohexane occupied levels by ~7 eV.
+            H_ab = 0.5 * (self.H[mu, mu] + self.H[nu, nu]) * S_ab
+        self.S[mu, nu] = self.S[nu, mu] = S_ab
+        self.H[mu, nu] = self.H[nu, mu] = H_ab
+
+    def fill_diag(self, A,mu):
         norm = simpson(A.u**2, x=A.grid)             # <phi|phi> ~ 1
         if abs(1 - norm) >= 1e-3:
             raise ValueError(
@@ -305,11 +341,7 @@ class H:
             # VO on-site: Rayleigh quotient of the confined orbital against the
             # free hamiltonian. Sits between eigN (variational min -> too deep)
             # and the confined eps (wall energy -> too high). 1D radial integral.
-            r, u = A.grid, A.u
-            Vphys = self.Veff[A.elem] - self.Vconf[A.elem]
-            up = np.gradient(u, r)
-            centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
-            E_ray = simpson(0.5 * up**2 + (centrifugal + Vphys) * u**2, x=r)
+            E_ray = self._radial_H(A, A)
             # bracket check: neutral level (too deep) < Rayleigh < confined eps (too high)
             eig_neutral = self.eigN[A.elem][A.n][A.l]
             eps_conf    = self.eigenvalues[A.elem][A.n][A.l]
@@ -324,8 +356,10 @@ class H:
             self.S[mu, mu] = 1.0
             self.H[mu, mu] = E_ray
             return
+        
         self.S[mu, mu] = 1.0
-        self.H[mu, mu] = self.eigN[A.elem][A.n][A.l]   # neutral on-site level
+        self.H[mu, mu] = (self._radial_H(A, A) if self.ONSITE_CONSISTENT
+                          else self.eigN[A.elem][A.n][A.l])   # neutral on-site level
 
     def fill_cross(self, A, B, mu, nu):
         from Y_real import Y_real
@@ -365,15 +399,19 @@ class H:
         self.H = np.zeros((self.N, self.N))
         self.S = np.zeros((self.N, self.N))
         self._vcache = {}                              # bond-frame V_{ll'm} per shell pair
+        # Diagonal FIRST: the 'epsS' on-site off-diagonal reads H[mu,mu] back,
+        # and the pair loop below would otherwise reach (mu,nu<mu) before the
+        # diagonal at (mu,mu) has been filled.
+        for mu, A in enumerate(self.basis):
+            self.fill_diag(A, mu)
         self._gkey = self._gval = None                 # last grid built (see _grid)
 
         for mu in range(self.N):
             for nu in range(mu + 1):       # lower triangle + diagonal
                 A, B = self.basis[mu], self.basis[nu]
                 if A.atom == B.atom:
-                    if mu == nu:
-                        self.fill_diag(A, mu)
-                    # same-atom off-diagonal = 0, leave it
+                    if mu != nu:
+                        self.fill_onsite(A, B, mu, nu)
                 else:
                     self.fill_cross(A, B, mu, nu)
         return self.H
