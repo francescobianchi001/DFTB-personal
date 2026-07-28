@@ -80,7 +80,7 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
 
 # One basis function (atomic orbital). Its position in the flat basis list is
 # its row/column index in H and S, so no separate index map is needed.
-AO = namedtuple('AO', 'atom elem n l m u grid d')
+AO = namedtuple('AO', 'atom elem n l m u grid d R')
 
 
 class H:
@@ -153,6 +153,7 @@ class H:
                              for i in range(len(self.basisets))]
 
         self.p = Path.cwd()
+        self._gkey = self._gval = None     # last pair grid built (see _grid)
         self.frozen_core = frozen_core
         self.distance = distance          # vestigial: bond lengths now come from the
                                           # geometry (self.dist). Kept for the legacy
@@ -172,15 +173,39 @@ class H:
         return S
 
     def build_grid(self,d,N=400):
+        """Quadrature grid for ONE pair at separation d. Returns the meshes and
+        the 1D node arrays Simpson needs, without touching instance state.
+
+        The z range is tied to d (not to the largest distance in the molecule):
+        at fixed N a bigger span means a coarser dz, and while the overlap is
+        smooth enough not to care, the H integrand's -Z/r cusps are resolved
+        badly enough that stretching the span from a bond length to 30 bohr
+        costs ~0.1 -> ~0.5 eV on individual two-center potential integrals.
+        Gridding per pair keeps every bond at diatomic resolution.
+
+        z stays symmetric about the bond midpoint d/2, which makes the
+        reflection z -> d-z map the node set onto itself. NB the A<->B exchange
+        identity does NOT rely on that: it holds pointwise on the integrand
+        (see cross_terms), so it survives any choice of grid.
+        """
         rmax = self.r[0][-1]
         r0 = self.r[0][0]
-        self.x = np.linspace(r0,rmax,N)
-        # z symmetric about the bond midpoint d/2 so the reflection z -> d-z maps
-        # the node set onto itself (needed for the Vint reflection-averaging in
-        # fill_element to be exact).
-        self.z = np.linspace(-rmax, d + rmax, N)
-        X,Z = np.meshgrid(self.x,self.z,indexing='ij')
-        return X,Z
+        x = np.linspace(r0,rmax,N)
+        z = np.linspace(-rmax, d + rmax, N)
+        X,Z = np.meshgrid(x,z,indexing='ij')
+        return X,Z,x,z
+
+    def _grid(self,d,N=400):
+        """build_grid with the last result remembered.
+
+        fill_cross asks for min(l1,l2)+1 channels per shell pair and they all
+        share a d, so a single remembered grid is hit every time after the
+        first. One slot, not a dict: each grid is ~2.6 MB, and a molecule has
+        far too many pairs to keep them all.
+        """
+        if self._gkey != (d, N):
+            self._gkey, self._gval = (d, N), self.build_grid(d, N)
+        return self._gval
 
     def build_basis(self,dAB):
         LMAX = 2                                              # SK integrals stop at d
@@ -194,6 +219,7 @@ class H:
                 shells = range(val, len(self.basisets[e]))
             else:
                 shells = range(len(self.basisets[e]))
+            R = self.coords[0][a]                             # this atom's xyz
             for n in shells:
                 for l in range(len(self.basisets[e][n])):
                     if l > LMAX:
@@ -203,77 +229,24 @@ class H:
                         continue
                     self.nelec += self.occupied[e][n][l]
                     for m in range(-l, l + 1):
-                        self.basis.append(AO(a, e, n, l, m, u, self.r[e], dAB[a]))
+                        self.basis.append(AO(a, e, n, l, m, u, self.r[e], dAB[a], R))
         self.N = len(self.basis)
         return self.N
 
     def space(self):
-        R = self.coords[0]                               # (natoms, 3), first frame
-        self.m = R.mean(axis=0)                           # dipole origin (centroid)
-        # full pairwise distance matrix: dist[a,b] = |R_a - R_b|, symmetric, 0 diag.
-        # same arithmetic as np.sqrt(np.sum(dR**2)), done for every pair via broadcast.
+        R = self.coords[0]                               
+        self.m = R.mean(axis=0)                         
         self.dist = np.sqrt(((R[:, None, :] - R[None, :, :])**2).sum(-1))
         self.build_basis(self.dist)
         return self.m
-      
-    def fill_element(self, mu, nu):
+     
+    def cross_terms(self,A,B,o=None):
         from Y_real import Y_real
-        A, B = self.basis[mu], self.basis[nu]
-
-        if A.atom == B.atom:
-            if mu == nu:
-                o =abs(A.m)
-                norm = simpson(A.u**2, x=A.grid)             # <phi|phi> ~ 1
-                if abs(1 - norm) >= 1e-3:
-                    raise ValueError(
-                        f"AO {mu} (atom {A.atom}, n{A.n} l{A.l} m{A.m}) "
-                        f"not normalized: <phi|phi>={norm}")
-                if (A.n, A.l) in self.vo_shells[A.elem]:
-                    # VO on-site (any s/p/d virtual, NOT the valence): Rayleigh
-                    # quotient of the CONFINED orbital against the FREE hamiltonian.
-                    # Sits between eigN (variational min -> too deep) and the
-                    # confined eps (wall energy -> too high). 1D radial integral,
-                    # <u|u>=1; kinetic by parts (u=0 at both ends kills the
-                    # boundary term). Veff (saved) = physical + valence Vconf, so
-                    # physical = Veff - Vconf regardless of this orbital's own wall.
-                    r, u = A.grid, A.u
-                    Vphys = self.Veff[A.elem] - self.Vconf[A.elem]
-                    up = np.gradient(u, r)
-                    centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
-                    E_ray = simpson(0.5 * up**2 + (centrifugal + Vphys) * u**2, x=r)
-                    # bracket check: neutral level (too deep) < Rayleigh < confined eps (too high)
-                    eig_neutral = self.eigN[A.elem][A.n][A.l]
-                    eps_conf    = self.eigenvalues[A.elem][A.n][A.l]
-                    if A.m == -A.l:
-                        print(f"[VO bracket] atom {A.atom} ({self.names[A.elem]}) "
-                              f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f} < "
-                              f"E_ray={E_ray:+.6f} < eps_conf={eps_conf:+.6f}")
-                    if not (eig_neutral <= E_ray <= eps_conf):
-                        print(f"WARNING: VO Rayleigh out of bracket for atom {A.atom} "
-                              f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f}, E_ray={E_ray:+.6f}, "
-                              f"eps_conf={eps_conf:+.6f}")
-                    self.Sij[mu, mu] = 1.0
-                    self.H[mu, mu]   = E_ray
-                    return
-                self.Sij[mu, mu] = 1.0
-                self.H[mu, mu]   = self.eigN[A.elem][A.n][A.l]# neutral on-site level
-            return                                              # off-diag same-atom = 0
-
-        if A.m != B.m:
-            return                                              # -> 0 by symmetry
-        o = abs(A.m)                                            # sigma/pi/delta channel
+        if o is None:
+            o = abs(A.m)                                            # sigma/pi/delta channel
         d = A.d[B.atom]
-        X = self.X
+        X, Zg, xg, zg = self._grid(d)          # this pair's own grid
 
-        # Symmetric two-center H. The eps*S trick eliminates the kinetic energy
-        # via EITHER atom's confined eigen-equation, giving two exact but
-        # numerically different forms. Using only A's breaks the A<->B
-        # permutation symmetry (eps_a*S != eps_b*S when the two orbitals differ,
-        # worst for the diffuse d whose VO-confined eps is far from the rest),
-        # leaking spurious Mulliken charge onto homonuclear atoms. Average both:
-        #   H_ab = 1/2 (eps_a+eps_b) S + 1/2 <a| Va_phys+Vb_phys - Wa - Wb |b>
-        # W_X = wall X was solved in (VO for a re-confined virtual, valence
-        # otherwise); Vx_phys = Veff_X - Vconf_X (valence) is the physical potential.
         wall_A = self.Vconf[A.elem]
         if (A.n, A.l) in self.vo_shells[A.elem] and self.Vconf_VO[A.elem] is not None:
             wall_A = self.Vconf_VO[A.elem]
@@ -302,55 +275,129 @@ class H:
             return b, b * VJ
 
         # Reflection-average over z -> d-z. Analytically the integral is invariant
-        # (the substitution swaps A<->B); numerically it symmetrizes the quadrature
-        # so the potential-weighted Vint is A<->B symmetric, not just S.
-        bS1, bV1 = integrand(self.Z)
-        bS2, bV2 = integrand(d - self.Z)
+        # (z -> d-z is a change of variable, exact for A != B as much as for A == B);
+        # numerically it symmetrizes the quadrature. What it really buys is the
+        # A<->B EXCHANGE identity: pointwise at every node the integrand obeys
+        #   f_AB(d-z) = (-1)^(l1+l2) f_BA(z)
+        # (the radial factors swap, and the angular weight flips because
+        # cos t1|_(d-z) = -cos t2|_z with P_l^m(-u) = (-1)^(l+m) P_l^m(u)), so the
+        # AVERAGED integrand is exactly (-1)^(l1+l2) times the swapped one and
+        #   V_{l1 l2 m}(A->B) = (-1)^(l1+l2) V_{l2 l1 m}(B->A)
+        # holds to the last bit. H_matrix only ever evaluates ONE ordering per pair
+        # (fill_cross gets A = the later atom, since the loop runs nu <= mu), so
+        # without this the answer would depend on the order the atoms happen to be
+        # listed in the xyz file -- 0.14 eV on the CO MO energies when tested.
+        bS1, bV1 = integrand(Zg)
+        bS2, bV2 = integrand(d - Zg)
         baseS = 0.5 * (bS1 + bS2)
         baseV = 0.5 * (bV1 + bV2)
-        S_SK = simpson(simpson(baseS, x=self.x, axis=0), x=self.z)
-        Vint = simpson(simpson(baseV, x=self.x, axis=0), x=self.z)
+        S_o = simpson(simpson(baseS, x=xg, axis=0), x=zg)
+        V_o = simpson(simpson(baseV, x=xg, axis=0), x=zg)
+        return S_o, V_o
 
-        eps_a = self.eigenvalues[A.elem][A.n][A.l]             # confined eps for the eps*S trick
-        eps_b = self.eigenvalues[B.elem][B.n][B.l]
-        self.Sij[mu, nu] = self.Sij[nu, mu] = S_SK
-        self.H[mu, nu]   = self.H[nu, mu]   = 0.5 * (eps_a + eps_b) * S_SK + Vint
+    def fill_diag(self, A, mu):
+        norm = simpson(A.u**2, x=A.grid)             # <phi|phi> ~ 1
+        if abs(1 - norm) >= 1e-3:
+            raise ValueError(
+                f"AO {mu} (atom {A.atom}, n{A.n} l{A.l} m{A.m}) "
+                f"not normalized: <phi|phi>={norm}")
+        if (A.n, A.l) in self.vo_shells[A.elem]:
+            # VO on-site: Rayleigh quotient of the confined orbital against the
+            # free hamiltonian. Sits between eigN (variational min -> too deep)
+            # and the confined eps (wall energy -> too high). 1D radial integral.
+            r, u = A.grid, A.u
+            Vphys = self.Veff[A.elem] - self.Vconf[A.elem]
+            up = np.gradient(u, r)
+            centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
+            E_ray = simpson(0.5 * up**2 + (centrifugal + Vphys) * u**2, x=r)
+            # bracket check: neutral level (too deep) < Rayleigh < confined eps (too high)
+            eig_neutral = self.eigN[A.elem][A.n][A.l]
+            eps_conf    = self.eigenvalues[A.elem][A.n][A.l]
+            if A.m == -A.l:
+                print(f"[VO bracket] atom {A.atom} ({self.names[A.elem]}) "
+                      f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f} < "
+                      f"E_ray={E_ray:+.6f} < eps_conf={eps_conf:+.6f}")
+            if not (eig_neutral <= E_ray <= eps_conf):
+                print(f"WARNING: VO Rayleigh out of bracket for atom {A.atom} "
+                      f"n{A.n} l{A.l}: eigN={eig_neutral:+.6f}, E_ray={E_ray:+.6f}, "
+                      f"eps_conf={eps_conf:+.6f}")
+            self.S[mu, mu] = 1.0
+            self.H[mu, mu] = E_ray
+            return
+        self.S[mu, mu] = 1.0
+        self.H[mu, mu] = self.eigN[A.elem][A.n][A.l]   # neutral on-site level
+
+    def fill_cross(self, A, B, mu, nu):
+        from Y_real import Y_real
+        l1, l2 = A.l, B.l
+        d = A.d[B.atom]
+        Lc, Mc, Nc = (B.R - A.R) / d                    # bond direction cosines A -> B
+
+        # Bond-frame reduced integrals V_{l1 l2 |m|}: depend only on the two
+        # shells and their separation, so compute once per shell pair and reuse
+        # for every (m1, m2).
+        key = (A.atom, A.n, l1, B.atom, B.n, l2)
+        if key not in self._vcache:
+            self._vcache[key] = {o: self.cross_terms(A, B, o)
+                                 for o in range(min(l1, l2) + 1)}
+        chan = self._vcache[key]
+
+        # E_{m1 m2} = sum_m rotations[(l1,m1,l2,m2,m)](L,M,N) * V_{l1 l2 m}.
+        # The rotation table decides which pairs vanish (missing key -> 0).
+        S_rot = V_rot = 0.0
+        for o, (S_o, V_o) in chan.items():
+            c = Y_real.rotations.get((l1, A.m, l2, B.m, o))
+            if c is None:                               # channel absent -> 0
+                continue
+            w = c(Lc, Mc, Nc)
+            S_rot += w * S_o
+            V_rot += w * V_o
+
+        eps_a = self.eigenvalues[A.elem][A.n][l1]       # confined eps for the eps*S trick
+        eps_b = self.eigenvalues[B.elem][B.n][l2]
+        H_rot = 0.5 * (eps_a + eps_b) * S_rot + V_rot
+        self.S[mu, nu] = self.S[nu, mu] = S_rot
+        self.H[mu, nu] = self.H[nu, mu] = H_rot
 
     def H_matrix(self):
         ensure_Y_real()                                # cache: generate only once
         self.space()                                   # basis + distance matrix + center
-        # the two-center grid runs along the pair axis (A at 0, B at d), so it has
-        # to reach the FURTHEST pair, not just the first bond.
-        self.X, self.Z = self.build_grid(self.dist.max())
-        self.H   = np.zeros((self.N, self.N))
-        self.Sij = np.zeros((self.N, self.N))
+        self.H = np.zeros((self.N, self.N))
+        self.S = np.zeros((self.N, self.N))
+        self._vcache = {}                              # bond-frame V_{ll'm} per shell pair
+        self._gkey = self._gval = None                 # last grid built (see _grid)
 
         for mu in range(self.N):
             for nu in range(mu + 1):       # lower triangle + diagonal
-                self.fill_element(mu, nu)
+                A, B = self.basis[mu], self.basis[nu]
+                if A.atom == B.atom:
+                    if mu == nu:
+                        self.fill_diag(A, mu)
+                    # same-atom off-diagonal = 0, leave it
+                else:
+                    self.fill_cross(A, B, mu, nu)
         return self.H
 
     def diag(self, thresh=1e-6):
         H = 0.5 * (self.H + self.H.T)
-        S = 0.5 * (self.Sij + self.Sij.T)
+        S = 0.5 * (self.S + self.S.T)
+        self.S = S
 
         s, U = np.linalg.eigh(S)
         keep = s > thresh
-        if not np.all(keep):
-            print(f"diag: dropping {np.sum(~keep)} of {len(s)} basis modes "
-                  f"(min S eig {s.min():.2e} < {thresh:.0e}) — basis near-singular")
+        ndrop = int(np.sum(~keep))
+        if ndrop:
+            print(f"diag: dropping {ndrop} of {len(s)} basis modes "
+                  f"(min S eig {s.min():.2e} <= {thresh:.0e}) — basis near-singular/over-complete")
         U, s = U[:, keep], s[keep]
 
-        X = U * (1.0 / np.sqrt(s))
-        H_ = X.T @ H @ X
-
-        E, C_ = np.linalg.eigh(H_)
+        X = U / np.sqrt(s)
+        E, C_ = np.linalg.eigh(X.T @ H @ X)
         C = X @ C_
 
         assert np.allclose(C.T @ S @ C, np.eye(C.shape[1]), atol=1e-8)
-        assert np.allclose(H @ C, S @ C @ np.diag(E), atol=1e-6)
-        
-        self.S= S
+        if ndrop == 0:
+            assert np.allclose(H @ C, S @ C @ np.diag(E), atol=1e-6)
 
         return E, C
 
