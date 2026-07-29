@@ -64,12 +64,19 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     missing = [sym for sym in atoms if sym not in on_disk]
     stale = prov is not None and prov != want
 
+    if prov is None and on_disk:
+        # Adopt what is there under the requested settings AND stamp it now. The
+        # stamp cannot wait for INIT to run: if it did, a tree that needs no work
+        # would stay unstamped, and the NEXT run -- with different settings --
+        # would still see prov=None, conclude "not stale", and silently reuse
+        # atoms solved at the wrong level of theory.
+        print(f"prepare_atoms: {sorted(on_disk)} on disk with no provenance record "
+              f"-- recording them as {want}. Delete atoms_provenance.json / the "
+              f"ATOMS_* dirs if that is wrong.")
+        manifest.write_text(json.dumps(
+            {'settings': want, 'elements': sorted(on_disk)}, indent=2))
     if not stale and not missing:
         return atoms
-    if prov is None and on_disk:
-        print(f"prepare_atoms: {sorted(on_disk)} on disk with no provenance record "
-              f"-- assuming they were solved at the requested settings {want}. "
-              f"Delete atoms_provenance.json / the ATOMS_* dirs to force a rebuild.")
     if stale:
         print(f"prepare_atoms: stored atoms were solved with {prov}, this run wants "
               f"{want} -> ALL elements will be recomputed")
