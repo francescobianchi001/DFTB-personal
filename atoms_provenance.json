@@ -3,12 +3,14 @@
     "VO": null,
     "r0": null,
     "r0_VO": null,
-    "lb94": false
+    "lb94": false,
+    "typor0": {
+      "H": 1.0837579,
+      "C": 2.6569549
+    }
   },
   "elements": [
     "C",
-    "H",
-    "N",
-    "O"
+    "H"
   ]
 }

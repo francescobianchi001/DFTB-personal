@@ -26,8 +26,6 @@ from pathlib import Path
 ATOMS = {
     "C": 6,
     "H": 1,
-    "N": 7,
-    "O": 8,
 }
 
 ROOT = Path(__file__).resolve().parent
@@ -82,10 +80,15 @@ def main():
                     help="wipe ATOMS_BS/ATOMS_POT/eig_neutral and redo every element "
                          "(implied when the requested settings differ from the stored "
                          "ones -- a change of method invalidates all of them)")
+    ap.add_argument("--typor0", type=json.loads, default=None, metavar="JSON",
+                    help="per-element confinement radii (bohr) as JSON, e.g. "
+                         "'{\"H\": 1.084, \"C\": 2.657}'; overrides --r0 per element")
     args = ap.parse_args()
 
     lb94 = resolve_lb94(args.lb94, args.VO)
     settings = {"VO": args.VO, "r0": args.r0, "r0_VO": args.r0_VO, "lb94": lb94}
+    if args.typor0:
+        settings["typor0"] = args.typor0
 
     if not PLOTTER.exists():
         sys.exit(f"solver not found: {PLOTTER}")
@@ -106,24 +109,20 @@ def main():
         d.mkdir(exist_ok=True)
 
     vo = ["--VO", str(args.VO)] if args.VO is not None else []
-    # r0_VO (split confinement) applies only to the confined basis solve, not the
-    # free-atom diagonal (which has no wall). It writes vo_shells/Vconf_VO so the
-    # DFTB Hamiltonian uses the Rayleigh on-site + VO-wall off-diagonal for virtuals.
     r0vo = ["--r0-VO", str(args.r0_VO)] if args.r0_VO is not None else []
-    # r0 override tunes the valence confinement (off-diagonal/bonding); it applies
-    # only to the confined solve, not the free-atom diagonal (which has no wall).
-    r0 = ["--r0", str(args.r0)] if args.r0 is not None else []
-    # Only the elements that are actually missing: same settings means whatever
-    # is already on disk was solved at this level of theory and can be kept.
+    typor0 = args.typor0 or {}
     todo = {a: Z for a, Z in ATOMS.items()
             if not (WFDIR / f"{a}.npz").exists()}
     keep = [a for a in ATOMS if a not in todo]
-    print(f"VO={args.VO}  r0={args.r0}  r0_VO={args.r0_VO}  LB94(free)={lb94}")
+    print(f"VO={args.VO}  r0={typor0 or args.r0}  r0_VO={args.r0_VO}  LB94(free)={lb94}")
     print(f"  solve: {list(todo) or '(nothing)'}"
           + (f"   keep (already at these settings): {keep}" if keep else ""))
 
     for atom, Z in todo.items():
         print(f"[{atom}] Z={Z}")
+        # Per-element radius wins over --r0; neither set keeps the solver default.
+        r0_atom = typor0.get(atom, args.r0)
+        r0 = ["--r0", str(r0_atom)] if r0_atom is not None else []
         # Confined pseudo-atom: basis shapes + confined eigenvalues + Veff/Vconf.
         run([str(Z), "--pseudoatom", "--exp-grid", *vo, *r0, *r0vo,
              "--save", str(WFDIR / atom),

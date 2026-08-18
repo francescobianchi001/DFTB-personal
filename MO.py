@@ -443,10 +443,14 @@ if __name__ == '__main__':
                     help='confinement radius (bohr) for the virtual shells')
     ap.add_argument('--r0', type=float, default=None,
                     help='confinement radius (bohr) for the valence shells')
+    ap.add_argument('--diffradi', nargs='?', const=True, default=None, dest='typor0',
+                    metavar='FILE',
+                    help='per-element confinement radii from FILE (default radi.txt), '
+                         'one "<symbol> <r0/bohr>" per line')
     args = ap.parse_args()
 
     viz = MOViz(geom=args.geom, frozen_core=not args.full,
-                vo=args.vo, lb94=args.lb94, r0_vo=args.r0_vo, r0=args.r0)
+                vo=args.vo, lb94=args.lb94, r0_vo=args.r0_vo, r0=args.r0, typor0=args.typor0)
     viz.print_levels()
     if args.mulliken:
         viz.print_charges()

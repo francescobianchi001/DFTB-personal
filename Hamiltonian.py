@@ -23,7 +23,24 @@ def ensure_Y_real(path=Path("Y_real.py")):
 
 ensure_Y_real()
 
-def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
+def read_radii(path):
+    """Parse a per-element confinement-radius file -> {symbol: r0/bohr}.
+
+    One "<symbol> <r0>" pair per line; blank lines and '#' comments ignored.
+    Symbols are capitalized so they match the ATOM_NAMES-derived keys used
+    everywhere else ("h 1.08" and "H 1.08" both land on "H")."""
+    radii = {}
+    for lineno, raw in enumerate(Path(path).read_text().splitlines(), 1):
+        fields = raw.split('#', 1)[0].split()
+        if not fields:
+            continue
+        if len(fields) != 2:
+            raise ValueError(f"{path}:{lineno}: expected '<symbol> <r0>', got {raw!r}")
+        radii[fields[0].capitalize()] = float(fields[1])
+    return radii
+
+
+def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
     """Make sure the per-atom .npz data for every element in `geom` exists.
 
     Reads the geometry, maps each atomic number to its element symbol (via
@@ -33,14 +50,19 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     already present nothing is recomputed. Returns {symbol: Z}.
 
     Generation options are forwarded to INIT.py's CLI:
-      vo   : int or None -- add this many virtual (polarization) shells (--VO N).
-      lb94 : True  -> force the LB94 -1/r tail on the free-atom solve (--lb94)
-             False -> disable it (--no-lb94)
-             None  -> let INIT decide (LB94 defaults on iff vo is set).
-      r0_vo: float or None -- weaker confinement radius (bohr) for the virtual
-             shells (--r0-VO). Triggers the split-confinement solve that writes
-             vo_shells/Vconf_VO, activating the Rayleigh on-site + VO-wall
-             off-diagonal treatment. Needs vo to be set to have any effect.
+      vo    : int or None -- add this many virtual (polarization) shells (--VO N).
+      lb94  : True  -> force the LB94 -1/r tail on the free-atom solve (--lb94)
+              False -> disable it (--no-lb94)
+              None  -> let INIT decide (LB94 defaults on iff vo is set).
+      r0_vo : float or None -- weaker confinement radius (bohr) for the virtual
+              shells (--r0-VO). Triggers the split-confinement solve that writes
+              vo_shells/Vconf_VO, activating the Rayleigh on-site + VO-wall
+              off-diagonal treatment. Needs vo to be set to have any effect.
+      r0    : float or None -- one valence confinement radius (bohr) for EVERY
+              element; None keeps the solver default 2*r_cov.
+      typor0: per-element confinement radii instead of the single r0. True reads
+              ./radi.txt, a path reads that file (format: see read_radii). An
+              element absent from the file falls back to r0, then to 2*r_cov.
     """
     atno, coords = get_coords(geom, maxlen=100)
     # unique elements in the geometry, Z -> capitalized symbol ("cl" -> "Cl")
@@ -49,9 +71,17 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
     p_bs = Path.cwd() / 'ATOMS_BS'
     manifest = Path.cwd() / 'atoms_provenance.json'
 
+    radii = None
+    if typor0:
+        radii = read_radii(Path.cwd() / 'radi.txt' if typor0 is True else typor0)
+
     # Same rule INIT.resolve_lb94 applies -- keep the two in step.
     want = {'VO': vo, 'r0': r0, 'r0_VO': r0_vo,
             'lb94': bool(lb94) if lb94 is not None else (vo is not None)}
+    if radii:
+        # Recorded only when in use, so editing radi.txt marks the atoms stale
+        # while plain runs still match older manifests.
+        want['typor0'] = radii
 
     prov = None
     if manifest.exists():
@@ -109,24 +139,24 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None):
         extra += ['--r0-VO', str(r0_vo)]
     if r0 is not None:
         extra += ['--r0', str(r0)]
+    if radii:
+        extra += ['--typor0', json.dumps(radii)]   # argv is strings only
 
     sub.run([sys.executable, str(init_path), *extra], check=True)
     return atoms
 
-# One basis function (atomic orbital). Its position in the flat basis list is
-# its row/column index in H and S, so no separate index map is needed.
 AO = namedtuple('AO', 'atom elem n l m u grid d R')
 
 
 class H:
 
     def __init__(self,distance=None,frozen_core=True,grid=None,geom='geometry.xyz',
-                 vo=None,lb94=None,r0_vo=None,r0=None):
+                 vo=None,lb94=None,r0_vo=None,r0=None,typor0=None):
 
         # Make sure every element in the geometry has its .npz data on disk
         # (runs INIT.py only if something is missing), then read the geometry.
         # vo / lb94 / r0_vo / r0 choose how those files are generated (see prepare_atoms).
-        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo, r0=r0)
+        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo, r0=r0, typor0=typor0)
         atom,coords = get_coords(geom, maxlen=100)
 
         p_bs = Path.cwd()/'ATOMS_BS'
