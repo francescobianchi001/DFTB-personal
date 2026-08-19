@@ -219,6 +219,8 @@ class H:
 
         self.p = Path.cwd()
         self._gkey = self._gval = None     # last pair grid built (see _grid)
+        self._diag_key = None              # thresh of the cached diag(), None = none
+        self.E = self.C = self.f = self.P = self.Eband = None
         self.frozen_core = frozen_core
         self.distance = distance          # vestigial: bond lengths now come from the
                                           # geometry (self.dist). Kept for the legacy
@@ -308,12 +310,16 @@ class H:
             rB = np.sqrt(X**2 + (Zc - d)**2)
             RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
             RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
-            VJ = (np.interp(rA.ravel(), A.grid, Vn_A, right=0.0).reshape(rA.shape)
-                  + np.interp(rB.ravel(), B.grid, Vn_B, right=0.0).reshape(rB.shape)
-                  - 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
-                           + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
-                           + np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
-                           + np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)))
+            #VJ = (np.interp(rA.ravel(), A.grid, Vn_A, right=0.0).reshape(rA.shape)
+            #      + np.interp(rB.ravel(), B.grid, Vn_B, right=0.0).reshape(rB.shape)
+            #      - 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
+            #               + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
+            #               + np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
+            #               + np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)))
+            VJ = 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
+                        + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
+                        - np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
+                        - np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape))
             b = RA * RB * AW(X, Zc, d) * X # X = rho Jacobian
             return b, b * VJ
 
@@ -364,34 +370,12 @@ class H:
                        + (centrifugal + Vphys) * A.u * B.u, x=r)
 
     def fill_onsite(self, A, B, mu, nu):
-        """Same-atom, DIFFERENT-shell block of H and S.
-
-        Was hardcoded to zero, which is exact only while every shell of an atom
-        comes from the SAME radial Hamiltonian. Split confinement (--r0-VO)
-        breaks that: the virtual shells solve a different equation, so same-l
-        valence<->virtual pairs are genuinely non-orthogonal -- measured 0.117
-        (C 2s-3s) and 0.171 (C 2p-3p). Leaving those at zero makes S stop being
-        the Gram matrix of any set of functions, so nothing guarantees it stays
-        positive definite, and it makes any contraction of two radial functions
-        on one atom ill-defined (the metric is asserted, not computed).
-
-        Only the atom's OWN potential enters here. The neighbours' potential
-        would add a crystal-field term <phi^A|V_B|phi'^A>, which standard DFTB
-        drops with the rest of the three-center terms; not included.
-        """
         if A.l != B.l or A.m != B.m:                 # orthogonal by the angular part
             return
         S_ab = self._radial_S(A, B)
         if self.ONSITE_MODE == 'radial':
             H_ab = self._radial_H(A, B)
         else:
-            # eps*S, the on-site analogue of what fill_cross does off-site (there
-            # is no V_J here: no other atom). Consistent with WHATEVER convention
-            # the diagonal uses, since it reads the diagonal back. Well behaved:
-            # for a 2x2 block it leaves the levels at their mean +- delta/sqrt(1-S^2),
-            # i.e. it only widens the splitting by a few percent, whereas mixing an
-            # eigN diagonal with <a|T+Vphys|b> off it represents no single operator
-            # and threw the cyclohexane occupied levels by ~7 eV.
             H_ab = 0.5 * (self.H[mu, mu] + self.H[nu, nu]) * S_ab
         self.S[mu, nu] = self.S[nu, mu] = S_ab
         self.H[mu, nu] = self.H[nu, mu] = H_ab
@@ -403,9 +387,6 @@ class H:
                 f"AO {mu} (atom {A.atom}, n{A.n} l{A.l} m{A.m}) "
                 f"not normalized: <phi|phi>={norm}")
         if (A.n, A.l) in self.vo_shells[A.elem]:
-            # VO on-site: Rayleigh quotient of the confined orbital against the
-            # free hamiltonian. Sits between eigN (variational min -> too deep)
-            # and the confined eps (wall energy -> too high). 1D radial integral.
             E_ray = self._radial_H(A, A)
             # bracket check: neutral level (too deep) < Rayleigh < confined eps (too high)
             eig_neutral = self.eigN[A.elem][A.n][A.l]
@@ -432,9 +413,6 @@ class H:
         d = A.d[B.atom]
         Lc, Mc, Nc = (B.R - A.R) / d                    # bond direction cosines A -> B
 
-        # Bond-frame reduced integrals V_{l1 l2 |m|}: depend only on the two
-        # shells and their separation, so compute once per shell pair and reuse
-        # for every (m1, m2).
         key = (A.atom, A.n, l1, B.atom, B.n, l2)
         if key not in self._vcache:
             self._vcache[key] = {o: self.cross_terms(A, B, o)
@@ -460,13 +438,12 @@ class H:
 
     def H_matrix(self):
         ensure_Y_real()                                # cache: generate only once
+        self._diag_key = None                          # stale diag results
+        self.E = self.C = self.f = self.P = self.Eband = None
         self.space()                                   # basis + distance matrix + center
         self.H = np.zeros((self.N, self.N))
         self.S = np.zeros((self.N, self.N))
         self._vcache = {}                              # bond-frame V_{ll'm} per shell pair
-        # Diagonal FIRST: the 'epsS' on-site off-diagonal reads H[mu,mu] back,
-        # and the pair loop below would otherwise reach (mu,nu<mu) before the
-        # diagonal at (mu,mu) has been filled.
         for mu, A in enumerate(self.basis):
             self.fill_diag(A, mu)
         self._gkey = self._gval = None                 # last grid built (see _grid)
@@ -481,7 +458,30 @@ class H:
                     self.fill_cross(A, B, mu, nu)
         return self.H
 
+    def occupations(self, E, tol=1e-5):
+        """Aufbau filling of E with self.nelec electrons, 2 per level.
+
+        Degenerate levels (within tol) share their electrons equally, so an
+        odd-electron system keeps the symmetry of its partly filled shell
+        instead of picking one member of the degenerate set at random.
+        """
+        f = np.zeros(len(E))
+        left = float(self.nelec)
+        k = 0
+        while left > 1e-12 and k < len(E):
+            g = k
+            while g + 1 < len(E) and E[g + 1] - E[k] < tol:
+                g += 1
+            n = g - k + 1
+            take = min(2.0 * n, left)
+            f[k:g + 1] = take / n
+            left -= take
+            k = g + 1
+        return f
+
     def diag(self, thresh=1e-6):
+        if self._diag_key == thresh:                   # H_matrix() invalidates
+            return self.E, self.C
         H = 0.5 * (self.H + self.H.T)
         S = 0.5 * (self.S + self.S.T)
         self.S = S
@@ -502,23 +502,25 @@ class H:
         if ndrop == 0:
             assert np.allclose(H @ C, S @ C @ np.diag(E), atol=1e-6)
 
+        self.E, self.C = E, C
+        self.f = self.occupations(E)                   # per-level occupation, sums to nelec
+        self.P = (C * self.f) @ C.T
+        self.Eband = float(self.f @ E)
+        self._diag_key = thresh
+
         return E, C
 
     def band_energy(self):
-        E, C = self.diag()
-        nocc = int(round(self.nelec)) // 2
-        return 2.0 * np.sum(E[:nocc])
+        self.diag()
+        return self.Eband
 
     def density_matrix(self):
-        E, C = self.diag()
-        nocc = int(round(self.nelec)) // 2
-        Cocc = C[:, :nocc]
-        P = 2.0 * Cocc @ Cocc.T
-        return P
+        self.diag()
+        return self.P
 
     def Mulliken_charge(self):
-        P = self.density_matrix()
-        gross = np.diag(P @ self.S)
+        self.diag()
+        gross = np.diag(self.P @ self.S)
         natoms = len(self.atoms)
         q = np.zeros(natoms)
         for mu, ao in enumerate(self.basis):

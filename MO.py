@@ -35,7 +35,11 @@ class MOViz:
         self.E, self.C = self.mol.diag()
         self.basis = self.mol.basis
         self.geom = geom
-        self.nocc = int(round(self.mol.nelec)) // 2
+        self.f = self.mol.f                     # occupations, P, Eband all from diag()
+        self.P = self.mol.P
+        self.Eband = self.mol.Eband
+        self.nocc = int(np.count_nonzero(self.f > 1e-12))   # incl. partly filled levels
+        self.nmo = len(self.E)                  # < N if diag() dropped modes
         # true 3D nuclear positions in bohr, (natoms, 3), first frame of the xyz.
         self.pos = np.asarray(self.mol.coords[0], dtype=float)
         self.symbols = [self.mol.names[self.mol.Z2elem[Z]] for Z in self.mol.atoms]
@@ -189,7 +193,7 @@ class MOViz:
         return Ss, Tt, self._psi_at(k, pts, key), plane, nuc
 
     def plot(self, which='all', npts=240, half=4.0):
-        ks = list(range(self.mol.N)) if which == 'all' else list(which)
+        ks = list(range(self.nmo)) if which == 'all' else list(which)
         ncols = min(4, len(ks))
         nrows = (len(ks) + ncols - 1) // ncols
         fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 3.4 * nrows),
@@ -244,7 +248,7 @@ class MOViz:
 
     def plot3d(self, which='all', npts=None, half=4.0, iso_frac=0.2, spacing=None):
         from skimage import measure
-        ks = list(range(self.mol.N)) if which == 'all' else list(which)
+        ks = list(range(self.nmo)) if which == 'all' else list(which)
         ncols = min(4, len(ks))
         nrows = (len(ks) + ncols - 1) // ncols
         fig = plt.figure(figsize=(3.6 * ncols, 3.6 * nrows))
@@ -286,11 +290,10 @@ class MOViz:
         print(f"\n{self.label}  MO levels  ({self.geom})")
         print(f"{'MO':>4} {'occ':>4} {'E (Ha)':>12} {'E (eV)':>10}")
         print('-' * 34)
-        for k in range(self.mol.N):
-            occ = 2 if k < self.nocc else 0
+        for k in range(self.nmo):
             mark = '  <- HOMO' if k == self.nocc - 1 else ('  <- LUMO' if k == self.nocc else '')
-            print(f"{k+1:>4} {occ:>4} {self.E[k]:>12.5f} {self.E[k]*HA:>10.2f}{mark}")
-        if self.nocc < self.mol.N:
+            print(f"{k+1:>4} {self.f[k]:>4.2f} {self.E[k]:>12.5f} {self.E[k]*HA:>10.2f}{mark}")
+        if self.nocc < self.nmo:
             gap = (self.E[self.nocc] - self.E[self.nocc - 1]) * HA
             print(f"HOMO-LUMO gap = {gap:.2f} eV\n")
         else:
@@ -304,6 +307,47 @@ class MOViz:
         for a, name in enumerate(self.symbols):
             print(f"{name:>6} {Dq[a]:>+10.5f}")
         print(f"{'sum':>6} {sum(Dq):>+10.2e}\n")
+    
+    def print_Eband(self):
+        """Band-structure energy: 2 * sum over the occupied levels."""
+        print(f"\n{self.label}  band energy  ({self.geom})")
+        print(f"  E_band = {self.Eband:>12.6f} Ha = {self.Eband * HA:>10.3f} eV")
+        print(f"  ({self.nocc} occupied of {self.nmo} MOs, "
+              f"{self.f.sum():.1f} of {self.mol.nelec:.0f} electrons)\n")
+
+    def ao_labels(self):
+        """One 'C1 2p+1' label per basis function, in basis order."""
+        sh = 'spdfg'
+        return [f"{self.symbols[ao.atom]}{ao.atom + 1} {ao.n}{sh[ao.l]}{ao.m:+d}"
+                for ao in self.basis]
+
+    def print_matrix(self, M, title, prec=4, ncol=8, width=10):
+        """Print an AO-indexed matrix in labelled column blocks."""
+        lab = self.ao_labels()
+        n = M.shape[0]
+        head = lab if n == len(lab) else [str(i + 1) for i in range(n)]
+        w = max(width, max(len(s) for s in head) + 1)
+        print(f"\n{self.label}  {title}  ({self.geom})  {M.shape[0]}x{M.shape[1]}")
+        for j0 in range(0, M.shape[1], ncol):
+            j1 = min(j0 + ncol, M.shape[1])
+            print(' ' * (w + 2) + ''.join(f"{head[j]:>{w}}" for j in range(j0, j1)))
+            for i in range(n):
+                print(f"{head[i]:>{w}}  "
+                      + ''.join(f"{M[i, j]:>{w}.{prec}f}" for j in range(j0, j1)))
+            print()
+
+    def print_density(self):
+        """Density matrix P = 2 sum_occ C C^T, plus its trace check."""
+        self.print_matrix(self.P, 'density matrix P')
+        print(f"  tr(P S) = {np.trace(self.P @ self.mol.S):.6f} "
+              f"({self.f.sum():.1f} electrons in {self.nocc} filled levels; "
+              f"nelec = {self.mol.nelec:.0f})\n")
+
+    def print_overlap(self):
+        self.print_matrix(self.mol.S, 'overlap matrix S')
+
+    def print_hamiltonian(self):
+        self.print_matrix(self.mol.H, 'Hamiltonian H (Ha)')
 
     def view3d_pyvista(self, start=None, npts=None, half=4.0, iso_frac=0.18,
                        spacing=None):
@@ -318,7 +362,7 @@ class MOViz:
                h  HOMO      l  LUMO      Home  first      End  last
         """
         import pyvista as pv
-        ks = list(range(self.mol.N))
+        ks = list(range(self.nmo))
         cur = [self.nocc - 1 if start is None else int(start)]
         cur[0] = min(max(cur[0], 0), len(ks) - 1)
 
@@ -382,7 +426,7 @@ class MOViz:
                        spacing=None):
         """Smooth, GPU (VTK) isosurfaces — one subplot per MO, linked cameras."""
         import pyvista as pv
-        ks = list(range(self.mol.N)) if which == 'all' else list(which)
+        ks = list(range(self.nmo)) if which == 'all' else list(which)
         ncols = min(4, len(ks))
         nrows = (len(ks) + ncols - 1) // ncols
         pl = pv.Plotter(shape=(nrows, ncols), title=f"{self.label} MOs")
@@ -408,6 +452,8 @@ class MOViz:
         pl.background_color = 'white'
         print('WINDOW_READY', flush=True)
         pl.show()
+    
+    
 
 
 if __name__ == '__main__':
@@ -447,15 +493,27 @@ if __name__ == '__main__':
                     metavar='FILE',
                     help='per-element confinement radii from FILE (default radi.txt), '
                          'one "<symbol> <r0/bohr>" per line')
+    ap.add_argument('--Eband', action='store_true',
+                    help='print the band energy and exit')
+    ap.add_argument('--P', action='store_true',
+                    help='print the density matrix and exit')
+    ap.add_argument('--S', dest='Smat', action='store_true',
+                    help='print the overlap matrix and exit')
+    ap.add_argument('--H', dest='Hmat', action='store_true',
+                    help='print the Hamiltonian matrix and exit')
     args = ap.parse_args()
 
     viz = MOViz(geom=args.geom, frozen_core=not args.full,
                 vo=args.vo, lb94=args.lb94, r0_vo=args.r0_vo, r0=args.r0, typor0=args.typor0)
     viz.print_levels()
-    if args.mulliken:
-        viz.print_charges()
-        sys.exit(0)
-    if args.levels:
+    printed = False
+    for flag, fn in ((args.Eband, viz.print_Eband), (args.mulliken, viz.print_charges),
+                     (args.Hmat, viz.print_hamiltonian), (args.Smat, viz.print_overlap),
+                     (args.P, viz.print_density)):
+        if flag:
+            fn()
+            printed = True
+    if printed or args.levels:
         sys.exit(0)
     if args.twod:
         plt.switch_backend('TkAgg'); viz.plot(which='all', half=args.half)
