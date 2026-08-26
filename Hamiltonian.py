@@ -171,6 +171,8 @@ class H:
 
         self.p = Path.cwd()
         self._gkey = self._gval = None    
+        self._skkey = self._skval = None
+        self._splcache = {}
         self._diag_key = None           
         self.E = self.C = self.f = self.P = self.Eband = None
         self.frozen_core = frozen_core
@@ -189,6 +191,8 @@ class H:
 
         return S
 
+    NXI = NETA = 90                                   # Gauss-Legendre nodes per direction
+
     def build_grid(self,d,N=400):
         rmax = self.r[0][-1]
         r0 = self.r[0][0]
@@ -201,6 +205,50 @@ class H:
         if self._gkey != (d, N):
             self._gkey, self._gval = (d, N), self.build_grid(d, N)
         return self._gval
+
+    def build_sk_grid(self, d, nxi, neta):
+        """Prolate spheroidal (xi, eta) Gauss-Legendre mesh for a pair at 0 and d.
+
+        xi = (rA+rB)/d in [1, xi_max], eta = (rA-rB)/d in [-1, 1]; both nuclei sit
+        at CORNERS (xi=1, eta=-+1) where the (xi^2-eta^2) Jacobian vanishes, so the
+        -Z/r cusps never fall inside the domain the way they do on a (rho, z) mesh.
+        rho drho dz = (d/2)^3 (xi^2 - eta^2) dxi deta.
+        """
+        rmax = self.r[0][-1]
+        xi_max = max(1.0 + 1e-9, 2.0 * rmax / d)
+        tx, wx = np.polynomial.legendre.leggauss(nxi)
+        te, we = np.polynomial.legendre.leggauss(neta)
+        xi = 1.0 + 0.5 * (tx + 1.0) * (xi_max - 1.0)
+        XI, ET = np.meshgrid(xi, te, indexing='ij')
+        W = np.outer(wx * 0.5 * (xi_max - 1.0), we) * (0.5 * d)**3 * (XI**2 - ET**2)
+        rA = 0.5 * d * (XI + ET)
+        rB = 0.5 * d * (XI - ET)
+        z = 0.5 * d * (1.0 + XI * ET)
+        rho = 0.5 * d * np.sqrt(np.clip((XI**2 - 1.0) * (1.0 - ET**2), 0.0, None))
+        return rA, rB, rho, z, W
+
+    def _sk_grid(self, d):
+        key = (d, self.NXI, self.NETA)
+        if self._skkey != key:
+            self._skkey = key
+            self._skval = self.build_sk_grid(d, self.NXI, self.NETA)
+        return self._skval
+
+    def _spline(self, key, x, y):
+        """Cached cubic spline; constant below x[0], zero beyond x[-1] (as np.interp)."""
+        f = self._splcache.get(key)
+        if f is None:
+            from scipy.interpolate import CubicSpline
+            f = CubicSpline(x, y, extrapolate=False)
+            self._splcache[key] = (f, x[0], x[-1], y[0])
+            return self._splcache[key]
+        return f
+
+    def _ev(self, key, x, y, q):
+        f, x0, x1, y0 = self._spline(key, x, y)
+        out = f(np.clip(q, x0, x1))
+        out = np.nan_to_num(out, nan=0.0)
+        return np.where(q > x1, 0.0, out)
 
     def build_basis(self,dAB):
         LMAX = 2                                              # SK integrals stop at d
@@ -240,7 +288,7 @@ class H:
         if o is None:
             o = abs(A.m)                                            # sigma/pi/delta channel
         d = A.d[B.atom]
-        X, Zg, xg, zg = self._grid(d)          # this pair's own grid
+        rA, rB, X, zc, W = self._sk_grid(d)    # prolate spheroidal GL mesh for this pair
 
         wall_A = self.Vconf[A.elem]
         if (A.n, A.l) in self.vo_shells[A.elem] and self.Vconf_VO[A.elem] is not None:
@@ -254,31 +302,26 @@ class H:
         Vn_B = self.Vneutral[B.elem]
         AW = Y_real.angular_weights[(A.l, B.l, o)]
 
-        # S_SK and Vint integrands, sampled at bond-axis coordinate Zc.
+        # S_SK and Vint integrands on the (xi, eta) mesh; rA, rB come from the grid.
         def integrand(Zc):
-            rA = np.sqrt(X**2 + Zc**2)
-            rB = np.sqrt(X**2 + (Zc - d)**2)
-            RA = np.interp(rA.ravel(), A.grid, A.u / A.grid, right=0.0).reshape(rA.shape)
-            RB = np.interp(rB.ravel(), B.grid, B.u / B.grid, right=0.0).reshape(rB.shape)
+            RA = self._ev(('R', A.elem, A.n, A.l), A.grid, A.u / A.grid, rA)
+            RB = self._ev(('R', B.elem, B.n, B.l), B.grid, B.u / B.grid, rB)
             #VJ = (np.interp(rA.ravel(), A.grid, Vn_A, right=0.0).reshape(rA.shape)
             #      + np.interp(rB.ravel(), B.grid, Vn_B, right=0.0).reshape(rB.shape)
             #      - 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
             #               + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
             #               + np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
             #               + np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape)))
-            VJ = 0.5 * (np.interp(rA.ravel(), A.grid, VphysA, right=0.0).reshape(rA.shape)
-                        + np.interp(rB.ravel(), B.grid, VphysB, right=0.0).reshape(rB.shape)
-                        - np.interp(rA.ravel(), A.grid, wall_A, right=0.0).reshape(rA.shape)
-                        - np.interp(rB.ravel(), B.grid, wall_B, right=0.0).reshape(rB.shape))
-            b = RA * RB * AW(X, Zc, d) * X # X = rho Jacobian
+            VJ = 0.5 * (self._ev(('Vp', A.elem), A.grid, VphysA, rA)
+                        + self._ev(('Vp', B.elem), B.grid, VphysB, rB)
+                        - self._ev(('W', A.elem, A.n, A.l), A.grid, wall_A, rA)
+                        - self._ev(('W', B.elem, B.n, B.l), B.grid, wall_B, rB))
+            b = RA * RB * AW(X, Zc, d)     # rho Jacobian is already inside W
             return b, b * VJ
 
-        bS1, bV1 = integrand(Zg)
-        bS2, bV2 = integrand(d - Zg)
-        baseS = 0.5 * (bS1 + bS2)
-        baseV = 0.5 * (bV1 + bV2)
-        S_o = simpson(simpson(baseS, x=xg, axis=0), x=zg)
-        V_o = simpson(simpson(baseV, x=xg, axis=0), x=zg)
+        bS, bV = integrand(zc)
+        S_o = float(np.sum(bS * W))
+        V_o = float(np.sum(bV * W))
         return S_o, V_o
 
     ONSITE_CONSISTENT = False
