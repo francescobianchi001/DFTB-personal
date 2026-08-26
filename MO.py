@@ -29,10 +29,17 @@ HA = 27.21138
 
 
 class MOViz:
-    def __init__(self, geom='geometry.xyz', frozen_core=True, **kw):
+    def __init__(self, geom='geometry.xyz', frozen_core=True, scc=True,
+                 alpha=0.3, tresh=1e-5, **kw):
         self.mol = H(geom=geom, frozen_core=frozen_core, **kw)
         self.mol.H_matrix()
-        self.E, self.C = self.mol.diag()
+        self.scc = scc
+        if scc:                                 # self-consistent charges: H = H0 + H1(Dq)
+            self.Ecoul, self.E, self.C = self.mol.SCF(tresh=tresh, alpha=alpha)
+            self.Etot = float(np.sum(self.mol.P * self.mol.H0)) + self.Ecoul
+        else:
+            self.Ecoul = self.Etot = None
+            self.E, self.C = self.mol.diag()
         self.basis = self.mol.basis
         self.geom = geom
         self.f = self.mol.f                     # occupations, P, Eband all from diag()
@@ -287,7 +294,8 @@ class MOViz:
 
     def print_levels(self):
         """Print the MO eigenvalues with occupation, HOMO/LUMO and gap."""
-        print(f"\n{self.label}  MO levels  ({self.geom})")
+        print(f"\n{self.label}  MO levels  ({self.geom})"
+              f"  [{'SCC' if self.scc else 'H0, no SCC'}]")
         print(f"{'MO':>4} {'occ':>4} {'E (Ha)':>12} {'E (eV)':>10}")
         print('-' * 34)
         for k in range(self.nmo):
@@ -312,6 +320,12 @@ class MOViz:
         """Band-structure energy: 2 * sum over the occupied levels."""
         print(f"\n{self.label}  band energy  ({self.geom})")
         print(f"  E_band = {self.Eband:>12.6f} Ha = {self.Eband * HA:>10.3f} eV")
+        if self.scc:
+            trPH0 = float(np.sum(self.mol.P * self.mol.H0))
+            print(f"  tr(P H0)={trPH0:>12.6f} Ha = {trPH0 * HA:>10.3f} eV")
+            print(f"  E_coul = {self.Ecoul:>12.6f} Ha = {self.Ecoul * HA:>10.3f} eV")
+            print(f"  E_tot  = {self.Etot:>12.6f} Ha = {self.Etot * HA:>10.3f} eV"
+                  f"   (tr(P H0) + E_coul)")
         print(f"  ({self.nocc} occupied of {self.nmo} MOs, "
               f"{self.f.sum():.1f} of {self.mol.nelec:.0f} electrons)\n")
 
@@ -347,7 +361,19 @@ class MOViz:
         self.print_matrix(self.mol.S, 'overlap matrix S')
 
     def print_hamiltonian(self):
-        self.print_matrix(self.mol.H, 'Hamiltonian H (Ha)')
+        self.print_matrix(self.mol.H,
+                          'Hamiltonian H = H0 + H1 (Ha)' if self.scc
+                          else 'Hamiltonian H0 (Ha)')
+
+    def print_charge_shifts(self):
+        """DFTB Dq = q - Z per atom, the quantity the SCC loop converges."""
+        Dq = -np.asarray(self.mol.Mulliken_charge())
+        print(f"\n{self.label}  SCC charge shifts  ({self.geom})")
+        print(f"{'atom':>6} {'Dq (q-Z)':>10}")
+        print('-' * 18)
+        for a, name in enumerate(self.symbols):
+            print(f"{name:>6} {Dq[a]:>+10.5f}")
+        print(f"{'sum':>6} {Dq.sum():>+10.2e}\n")
 
     def view3d_pyvista(self, start=None, npts=None, half=4.0, iso_frac=0.18,
                        spacing=None):
@@ -501,13 +527,23 @@ if __name__ == '__main__':
                     help='print the overlap matrix and exit')
     ap.add_argument('--H', dest='Hmat', action='store_true',
                     help='print the Hamiltonian matrix and exit')
+    ap.add_argument('--no-scc', dest='scc', action='store_false', default=True,
+                    help='skip the SCC loop, use the H0 (non-self-consistent) solution')
+    ap.add_argument('--alpha', type=float, default=0.3,
+                    help='SCC linear-mixing weight on the new charges (default 0.3)')
+    ap.add_argument('--tresh', type=float, default=1e-5,
+                    help='SCC convergence threshold on dE_coul and max|dDq| (default 1e-5)')
+    ap.add_argument('--dq', action='store_true',
+                    help='print the SCC charge shifts Dq = q - Z and exit')
     args = ap.parse_args()
 
-    viz = MOViz(geom=args.geom, frozen_core=not args.full,
+    viz = MOViz(geom=args.geom, frozen_core=not args.full, scc=args.scc,
+                alpha=args.alpha, tresh=args.tresh,
                 vo=args.vo, lb94=args.lb94, r0_vo=args.r0_vo, r0=args.r0, typor0=args.typor0)
     viz.print_levels()
     printed = False
     for flag, fn in ((args.Eband, viz.print_Eband), (args.mulliken, viz.print_charges),
+                     (args.dq, viz.print_charge_shifts),
                      (args.Hmat, viz.print_hamiltonian), (args.Smat, viz.print_overlap),
                      (args.P, viz.print_density)):
         if flag:

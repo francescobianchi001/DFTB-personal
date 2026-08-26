@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import matplotlib.pyplot as pl
 from scipy.integrate import simpson
+from scipy import special
 import subprocess as sub
 from collections import namedtuple
 from read_xyz import get_coords, ATOM_NAMES
@@ -23,12 +24,10 @@ def ensure_Y_real(path=Path("Y_real.py")):
 
 ensure_Y_real()
 
-def read_radii(path):
-    """Parse a per-element confinement-radius file -> {symbol: r0/bohr}.
+Ubbard = {'C':0.376, 'H': 0.395,          # Koskinen sec.V D (adjusted)
+          'O':0.4468, 'N': 0.530}         # O = IE-EA; N unbound anion -> Hotbit value
 
-    One "<symbol> <r0>" pair per line; blank lines and '#' comments ignored.
-    Symbols are capitalized so they match the ATOM_NAMES-derived keys used
-    everywhere else ("h 1.08" and "H 1.08" both land on "H")."""
+def read_radii(path):
     radii = {}
     for lineno, raw in enumerate(Path(path).read_text().splitlines(), 1):
         fields = raw.split('#', 1)[0].split()
@@ -41,31 +40,7 @@ def read_radii(path):
 
 
 def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
-    """Make sure the per-atom .npz data for every element in `geom` exists.
-
-    Reads the geometry, maps each atomic number to its element symbol (via
-    ATOM_NAMES), writes those elements into INIT.py's ATOMS dict, and runs
-    INIT.py to generate the basis/potential/eig files -- but ONLY if any of
-    the expected ATOMS_BS/<symbol>.npz files are missing. If they are all
-    already present nothing is recomputed. Returns {symbol: Z}.
-
-    Generation options are forwarded to INIT.py's CLI:
-      vo    : int or None -- add this many virtual (polarization) shells (--VO N).
-      lb94  : True  -> force the LB94 -1/r tail on the free-atom solve (--lb94)
-              False -> disable it (--no-lb94)
-              None  -> let INIT decide (LB94 defaults on iff vo is set).
-      r0_vo : float or None -- weaker confinement radius (bohr) for the virtual
-              shells (--r0-VO). Triggers the split-confinement solve that writes
-              vo_shells/Vconf_VO, activating the Rayleigh on-site + VO-wall
-              off-diagonal treatment. Needs vo to be set to have any effect.
-      r0    : float or None -- one valence confinement radius (bohr) for EVERY
-              element; None keeps the solver default 2*r_cov.
-      typor0: per-element confinement radii instead of the single r0. True reads
-              ./radi.txt, a path reads that file (format: see read_radii). An
-              element absent from the file falls back to r0, then to 2*r_cov.
-    """
     atno, coords = get_coords(geom, maxlen=100)
-    # unique elements in the geometry, Z -> capitalized symbol ("cl" -> "Cl")
     atoms = {ATOM_NAMES[int(Z)].capitalize(): int(Z) for Z in atno}
 
     p_bs = Path.cwd() / 'ATOMS_BS'
@@ -75,12 +50,9 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
     if typor0:
         radii = read_radii(Path.cwd() / 'radi.txt' if typor0 is True else typor0)
 
-    # Same rule INIT.resolve_lb94 applies -- keep the two in step.
     want = {'VO': vo, 'r0': r0, 'r0_VO': r0_vo,
             'lb94': bool(lb94) if lb94 is not None else (vo is not None)}
     if radii:
-        # Recorded only when in use, so editing radi.txt marks the atoms stale
-        # while plain runs still match older manifests.
         want['typor0'] = radii
 
     prov = None
@@ -95,11 +67,6 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
     stale = prov is not None and prov != want
 
     if prov is None and on_disk:
-        # Adopt what is there under the requested settings AND stamp it now. The
-        # stamp cannot wait for INIT to run: if it did, a tree that needs no work
-        # would stay unstamped, and the NEXT run -- with different settings --
-        # would still see prov=None, conclude "not stale", and silently reuse
-        # atoms solved at the wrong level of theory.
         print(f"prepare_atoms: {sorted(on_disk)} on disk with no provenance record "
               f"-- recording them as {want}. Delete atoms_provenance.json / the "
               f"ATOMS_* dirs if that is wrong.")
@@ -114,10 +81,6 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
         print(f"prepare_atoms: missing basis data for {missing} -> solving just those "
               f"(keeping {sorted(on_disk)})")
 
-    # Rewrite the ATOMS = { ... } dict in INIT.py. It must list the UNION of what
-    # is already on disk and what this geometry needs: INIT skips elements it
-    # already has, but on a settings change it rebuilds every element in the
-    # dict, and anything left out of it would be silently lost.
     keep = {sym: ATOM_NAMES.index(sym.lower()) for sym in on_disk
             if sym.lower() in ATOM_NAMES}
     init_path = Path.cwd() / 'INIT.py'
@@ -127,7 +90,6 @@ def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
     text = re.sub(r'ATOMS = \{.*?\}', block, text, count=1, flags=re.DOTALL)
     init_path.write_text(text)
 
-    # Forward the chosen generation options to INIT.py's argparse CLI.
     extra = []
     if vo is not None:
         extra += ['--VO', str(vo)]
@@ -153,9 +115,6 @@ class H:
     def __init__(self,distance=None,frozen_core=True,grid=None,geom='geometry.xyz',
                  vo=None,lb94=None,r0_vo=None,r0=None,typor0=None):
 
-        # Make sure every element in the geometry has its .npz data on disk
-        # (runs INIT.py only if something is missing), then read the geometry.
-        # vo / lb94 / r0_vo / r0 choose how those files are generated (see prepare_atoms).
         prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo, r0=r0, typor0=typor0)
         atom,coords = get_coords(geom, maxlen=100)
 
@@ -163,12 +122,9 @@ class H:
         p_pot = Path.cwd()/'ATOMS_POT'
 
         atoms = []
-        self.names = []          # element label per atom (file stem)
-        self.Znum = []           # atomic number (self.Z is taken by the z-grid)
+        self.names = []       
+        self.Znum = []         
 
-
-        # Sort all three dirs by stem so ATOMS_BS / ATOMS_POT / eig_neutral load in
-        # the SAME element order -> a single element index `e` addresses all of them.
         for entry in sorted(p_bs.iterdir(), key=lambda p: p.stem):
             if entry.is_file():
                 data = np.load(entry,allow_pickle=True)   # don't clobber `atom`
@@ -188,16 +144,12 @@ class H:
         self.eigenvalues = [data['eigenvalues'].tolist() for data in atoms]
         self.Veff = [data['Veff'] for data in V]
         self.Vconf = [data['Vconf']  for data in V]
-        # split confinement: virtual shells listed in vo_shells use Vconf_VO
-        # instead of Vconf. Absent (single-wall runs) -> None / empty set.
         self.Vconf_VO = [data['Vconf_VO'] if 'Vconf_VO' in data.files else None
                          for data in V]
         self.vo_shells = [set(map(tuple, data['vo_shells'].tolist()))
                           if 'vo_shells' in data.files else set() for data in V]
         
         self.atoms, self.coords = atom,coords         # atom = atomic numbers (natoms,)
-        # map atomic number -> index into the per-element loaded arrays above, so
-        # a physical atom `a` reaches its basis/potential via self.Z2elem[self.atoms[a]].
         self.Z2elem = {Z: e for e, Z in enumerate(self.Znum)}
 
         pth = Path.cwd()/'eig_neutral'
@@ -218,13 +170,11 @@ class H:
                              for i in range(len(self.basisets))]
 
         self.p = Path.cwd()
-        self._gkey = self._gval = None     # last pair grid built (see _grid)
-        self._diag_key = None              # thresh of the cached diag(), None = none
+        self._gkey = self._gval = None    
+        self._diag_key = None           
         self.E = self.C = self.f = self.P = self.Eband = None
         self.frozen_core = frozen_core
-        self.distance = distance          # vestigial: bond lengths now come from the
-                                          # geometry (self.dist). Kept for the legacy
-                                          # SK_int_parametre / constructor contract.
+        self.distance = distance        
 
     def SK_int_parametre(self, distance):
 
@@ -331,38 +281,14 @@ class H:
         V_o = simpson(simpson(baseV, x=xg, axis=0), x=zg)
         return S_o, V_o
 
-    # Use the radial matrix element for the VALENCE diagonal too, making the
-    # whole on-site block refer to one operator (T + V_phys). Off by default:
-    # the eigN diagonal is what the LB94/IP work was validated against, and
-    # swapping it moves every on-site level. Flip it to experiment.
     ONSITE_CONSISTENT = False
 
-    # How the same-atom off-diagonal H is built (S is always the radial overlap):
-    #   'epsS'   0.5*(H_nn + H_n'n') * S   -- the on-site analogue of the eps*S
-    #            trick fill_cross uses; consistent with the diagonal convention
-    #            whatever it is, and only widens level splittings slightly.
-    #   'radial' <a| T + V_phys |b> directly -- first-principles, but only
-    #            meaningful together with ONSITE_CONSISTENT = True, since
-    #            otherwise the diagonal comes from a different operator.
     ONSITE_MODE = 'epsS'
 
     def _radial_S(self, A, B):
-        """<phi_A|phi_B> for two shells on the SAME atom: a 1D radial integral.
-
-        Zero unless (l, m) match -- different l or m are killed by the angular
-        integral, so only same-(l,m) radial pairs survive.
-        """
         return simpson(A.u * B.u, x=A.grid)
 
     def _radial_H(self, A, B):
-        """<phi_A| T + V_phys |phi_B> on one atom, same (l, m). 1D radial.
-
-        Kinetic taken by parts (u vanishes at both ends, so no boundary term):
-        <a|T|b> = int [ 1/2 u_a' u_b' + l(l+1)/(2r^2) u_a u_b ] dr.
-        V_phys = Veff - Vconf is the FREE atomic potential: Veff as saved is
-        physical + valence Vconf, whatever wall this particular shell used.
-        A == B reproduces the Rayleigh quotient exactly.
-        """
         r = A.grid
         Vphys = self.Veff[A.elem] - self.Vconf[A.elem]
         centrifugal = A.l * (A.l + 1) / (2.0 * r**2)
@@ -419,8 +345,6 @@ class H:
                                  for o in range(min(l1, l2) + 1)}
         chan = self._vcache[key]
 
-        # E_{m1 m2} = sum_m rotations[(l1,m1,l2,m2,m)](L,M,N) * V_{l1 l2 m}.
-        # The rotation table decides which pairs vanish (missing key -> 0).
         S_rot = V_rot = 0.0
         for o, (S_o, V_o) in chan.items():
             c = Y_real.rotations.get((l1, A.m, l2, B.m, o))
@@ -456,15 +380,10 @@ class H:
                         self.fill_onsite(A, B, mu, nu)
                 else:
                     self.fill_cross(A, B, mu, nu)
+        self.H0 = self.H.copy()                        # SCC overwrites self.H
         return self.H
 
     def occupations(self, E, tol=1e-5):
-        """Aufbau filling of E with self.nelec electrons, 2 per level.
-
-        Degenerate levels (within tol) share their electrons equally, so an
-        odd-electron system keeps the symmetry of its partly filled shell
-        instead of picking one member of the degenerate set at random.
-        """
         f = np.zeros(len(E))
         left = float(self.nelec)
         k = 0
@@ -479,9 +398,9 @@ class H:
             k = g + 1
         return f
 
-    def diag(self, thresh=1e-6):
-        if self._diag_key == thresh:                   # H_matrix() invalidates
-            return self.E, self.C
+    def diag(self, thresh=1e-6,H=None):
+        if H is not None:
+            self.H = H                                 # keep self.H in step: Mulliken_charge() re-diags it
         H = 0.5 * (self.H + self.H.T)
         S = 0.5 * (self.S + self.S.T)
         self.S = S
@@ -506,7 +425,6 @@ class H:
         self.f = self.occupations(E)                   # per-level occupation, sums to nelec
         self.P = (C * self.f) @ C.T
         self.Eband = float(self.f @ E)
-        self._diag_key = thresh
 
         return E, C
 
@@ -529,6 +447,63 @@ class H:
         for atom, elem, n, l in {(ao.atom, ao.elem, ao.n, ao.l) for ao in self.basis}:
             Z[atom] += self.occupied[elem][n][l]
         return [Z[a] - q[a] for a in range(natoms)]
+
+    def SCC(self,H0,y,h1old=None,alpha=0.3):
+        def merge(old,new):
+            return old*(1-alpha) + new*alpha
+        Dq = -np.asarray(self.Mulliken_charge())     
+        DQ = Dq[None,:]*Dq[:,None]
+        Ec = 1/2 * sum(sum(DQ*y))
+        Ecoul = 1/2*Dq@y@Dq
+        
+        e = np.array([y[i,:]@Dq for i in range(len(self.atoms))])
+        eAO = np.array([e[ao.atom] for ao in self.basis])      
+        h1 = 0.5 * self.S * (eAO[:,None] + eAO[None,:])                                  
+        if h1old is not None:
+            h1 = merge(h1old,h1)
+        H = H0 + h1
+        E,C = self.diag(H=H)
+
+        return Ecoul,E,C,Dq,h1
+
+    def SCF(self,tresh=1e-5,N=400,alpha=0.3):
+        R = self.dist
+        U = np.array([Ubbard[self.names[self.Z2elem[Z]]] for Z in self.atoms])
+        FWHM = 1.329/U
+        y=np.zeros((len(U),len(U)))
+        for I in range(len(U)):
+            for J in range(len(U)):
+                if I==J:
+                   y[I,I] = U[I]
+                else:
+                   CIJ = np.sqrt(4*np.log(2)/((FWHM[I])**2+FWHM[J]**2))
+                   yIJ = special.erf(CIJ*R[I][J])/R[I][J]
+                   y[I][J]=y[J][I]=yIJ
+        H0 = self.H0 
+        Ec,E,C,Dq,h1 = self.SCC(H0,y,alpha=alpha)
+        for i in range(N):
+
+            Ec_new,E_new,C_new,Dq_new,h1new = self.SCC(H0,y,h1,alpha)
+            if abs(Ec_new - Ec) <= tresh and np.max(np.abs(Dq_new-Dq)) <= tresh:
+                return Ec_new,E_new,C_new
+            
+            Ec,E,C,Dq,h1 = Ec_new, E_new,C_new,Dq_new,h1new 
+        raise RuntimeError(f"SCF: no convergence in {N} iterations "
+                           f"(dEc={abs(Ec_new-Ec):.2e}, dDq={np.max(np.abs(Dq_new-Dq)):.2e}, tresh={tresh:.0e})")
+
+    def E_tot(self):
+        Ec,E,C = self.SCF()
+        return float(np.sum(self.P * self.H0)) + Ec, E,C  
+
+
+
+
+
+
+
+
+
+
 
             
 

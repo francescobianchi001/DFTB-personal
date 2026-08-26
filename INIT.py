@@ -25,6 +25,8 @@ from pathlib import Path
 # atom label -> atomic number Z. Edit to change the system (default: He dimer).
 ATOMS = {
     "C": 6,
+    "H": 1,
+    "O": 8,
 }
 
 ROOT = Path(__file__).resolve().parent
