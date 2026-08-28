@@ -1,0 +1,265 @@
+"""
+Symbolic generation of Slater-Koster transformation tables with sympy.
+
+Method
+------
+Real regular solid harmonics C_{lm}(x,y,z) (Racah normalisation) are rotated
+into the frame where the bond direction d = (L,M,N) becomes the z axis.  In
+that frame the two-centre integrals are diagonal in the magnetic quantum
+number mu and depend only on |mu|  (sigma, pi, delta, ...).  Hence
+
+    E_{lm,l'm'} = sum_mu  D^{l}_{mu,m} D^{l'}_{mu,m'} V_{l l' |mu|}
+
+with D defined by   C_{lm}(R^{-1} u) = sum_mu D^{l}_{mu,m} C_{l mu}(u).
+
+D is extracted by projection on the unit sphere.  The resulting rational
+expressions are reduced modulo  L^2 + M^2 + N^2 - 1,  which turns them into
+the polynomials of the published table.
+
+Works for arbitrary l (s, p, d, f, ...).  The table depends only on (l, l'),
+never on the radial index -- so with several radial functions per l you
+generate it once and reuse it for every (q, q') pair.
+"""
+
+import itertools
+import sympy as sp
+from sympy import sqrt, binomial, factorial, factorial2, Rational
+
+x, y, z = sp.symbols('x y z', real=True)
+u1, u2, u3 = sp.symbols('u1 u2 u3', real=True)
+L, M, N = sp.symbols('L M N', real=True)
+s = sp.symbols('s', positive=True)          # sqrt(L^2 + M^2)
+
+SPHERE = L**2 + M**2 + N**2 - 1
+
+
+# ----------------------------------------------------------------- harmonics
+def _Pi(l, m, Z, r2):
+    tot = 0
+    for k in range((l - m) // 2 + 1):
+        tot += ((-1)**k * Rational(1, 2**l) * binomial(l, k)
+                * binomial(2 * l - 2 * k, l)
+                * factorial(l - 2 * k) / factorial(l - 2 * k - m)
+                * r2**k * Z**(l - 2 * k - m))
+    return sp.expand(tot)
+
+
+def solid(l, m, X=x, Y=y, Z=z):
+    """Real regular solid harmonic, Racah normalised.
+    m > 0 : cosine type,  m < 0 : sine type."""
+    am = abs(m)
+    r2 = X**2 + Y**2 + Z**2
+    pref = sqrt(Rational(2 - (1 if m == 0 else 0))) * sqrt(
+        Rational(int(factorial(l - am)), int(factorial(l + am))))
+    ang = sp.expand((X + sp.I * Y)**am)
+    ang = sp.re(ang) if m >= 0 else sp.im(ang)
+    return sp.expand(pref * _Pi(l, am, Z, r2) * sp.expand(ang))
+
+
+# ------------------------------------------------------- integrals over S^2
+def sphere_int(expr, vars3):
+    """Integral of a polynomial over the unit sphere, divided by 4*pi."""
+    a, b, c = vars3
+    p = sp.Poly(sp.expand(expr), a, b, c)
+    tot = 0
+    for (i, j, k), coeff in p.terms():
+        if i % 2 or j % 2 or k % 2:
+            continue
+        tot += coeff * (factorial2(i - 1) * factorial2(j - 1) * factorial2(k - 1)
+                        / factorial2(i + j + k + 1))
+    return sp.simplify(tot)
+
+
+# ------------------------------------------------------------ rotation of r
+# R^{-1} maps zhat -> (L, M, N);  the residual freedom about the bond axis
+# cancels because +mu and -mu are always summed together.
+Rinv = sp.Matrix([[L * N / s, -M / s, L],
+                  [M * N / s,  L / s, M],
+                  [-s,         0,     N]])
+_rot = Rinv * sp.Matrix([u1, u2, u3])
+ROT = {x: _rot[0], y: _rot[1], z: _rot[2]}
+
+
+def reduce_dc(e):
+    """Reduce modulo s^2 = L^2+M^2 and L^2+M^2+N^2 = 1.
+    Tries several monomial orders and keeps the most compact result."""
+    e = sp.expand(e)
+    for _ in range(8):
+        e = sp.expand(e.subs(s**2, L**2 + M**2))
+    if e.has(s):
+        raise RuntimeError('odd power of s survived: ' + str(e))
+
+    best = None
+    for order in ('grevlex', 'grlex'):
+        for perm in itertools.permutations((L, M, N)):
+            cur = e
+            for _ in range(10):
+                cur = sp.cancel(sp.together(sp.expand(cur)))
+                num, den = sp.fraction(cur)
+                num = sp.reduced(sp.expand(num), [SPHERE], *perm,
+                                 order=order, domain='EX')[1]
+                den = sp.reduced(sp.expand(den), [SPHERE], *perm,
+                                 order=order, domain='EX')[1]
+                new = sp.cancel(sp.expand(num) / sp.expand(den))
+                if new == cur:
+                    break
+                cur = new
+            cur = sp.factor(sp.simplify(cur))
+            if best is None or sp.count_ops(cur) < sp.count_ops(best):
+                best = cur
+    return best
+
+
+# ------------------------------------------------------------- D^{l}_{mu,m}
+_Dcache = {}
+
+
+def Dmat(l):
+    if l in _Dcache:
+        return _Dcache[l]
+    basis = {mu: solid(l, mu, u1, u2, u3) for mu in range(-l, l + 1)}
+    norms = {mu: sphere_int(basis[mu]**2, (u1, u2, u3)) for mu in basis}
+    D = {}
+    for m in range(-l, l + 1):
+        rotated = sp.expand(solid(l, m).subs(ROT, simultaneous=True))
+        for mu in range(-l, l + 1):
+            proj = sphere_int(sp.expand(rotated * basis[mu]), (u1, u2, u3))
+            D[(mu, m)] = sp.simplify(proj / norms[mu])
+    _Dcache[l] = D
+    return D
+
+
+# -------------------------------------------------------- SK decomposition
+def sk_coeffs(l1, m1, l2, m2, reduce=True):
+    """{|mu|: coefficient of V_{l1 l2 |mu|}} for the (l1 m1 | l2 m2) element."""
+    D1, D2 = Dmat(l1), Dmat(l2)
+    out = {}
+    for mu in range(0, min(l1, l2) + 1):
+        if mu == 0:
+            c = D1[(0, m1)] * D2[(0, m2)]
+        else:
+            c = D1[(mu, m1)] * D2[(mu, m2)] + D1[(-mu, m1)] * D2[(-mu, m2)]
+        c = reduce_dc(c) if reduce else sp.simplify(c.subs(s**2, L**2 + M**2))
+        if sp.simplify(c) != 0:
+            out[mu] = c
+    return out
+
+
+LABEL = {0: {0: 's'},
+         1: {-1: 'y', 0: 'z', 1: 'x'},
+         2: {-2: 'xy', -1: 'yz', 0: 'z2', 1: 'zx', 2: 'x2-y2'}}
+GREEK = {0: 'sig', 1: 'pi', 2: 'del'}
+
+
+# ------------------------------------------------------------ verification
+def _ref():
+    """Subset of the published table (Slater & Koster 1954)."""
+    h = Rational(1, 2)
+    r3 = sqrt(3)
+    z2 = N**2 - (L**2 + M**2) / 2
+    d = L**2 - M**2
+    return {
+        ('s', 's'):   {0: sp.Integer(1)},
+        ('s', 'x'):   {0: L},
+        ('x', 'x'):   {0: L**2, 1: 1 - L**2},
+        ('x', 'y'):   {0: L * M, 1: -L * M},
+        ('x', 'z'):   {0: L * N, 1: -L * N},
+        ('s', 'xy'):  {0: r3 * L * M},
+        ('s', 'x2-y2'): {0: r3 * h * d},
+        ('s', 'z2'):  {0: z2},
+        ('x', 'xy'):  {0: r3 * L**2 * M, 1: M * (1 - 2 * L**2)},
+        ('x', 'yz'):  {0: r3 * L * M * N, 1: -2 * L * M * N},
+        ('x', 'zx'):  {0: r3 * L**2 * N, 1: N * (1 - 2 * L**2)},
+        ('x', 'x2-y2'): {0: r3 * h * L * d, 1: L * (1 - d)},
+        ('y', 'x2-y2'): {0: r3 * h * M * d, 1: -M * (1 + d)},
+        ('z', 'x2-y2'): {0: r3 * h * N * d, 1: -N * d},
+        ('x', 'z2'):  {0: L * z2, 1: -r3 * L * N**2},
+        ('z', 'z2'):  {0: N * z2, 1: r3 * N * (L**2 + M**2)},
+        ('xy', 'xy'): {0: 3 * L**2 * M**2,
+                       1: L**2 + M**2 - 4 * L**2 * M**2,
+                       2: N**2 + L**2 * M**2},
+        ('xy', 'yz'): {0: 3 * L * M**2 * N,
+                       1: L * N * (1 - 4 * M**2),
+                       2: L * N * (M**2 - 1)},
+        ('xy', 'zx'): {0: 3 * L**2 * M * N,
+                       1: M * N * (1 - 4 * L**2),
+                       2: M * N * (L**2 - 1)},
+        ('xy', 'x2-y2'): {0: Rational(3, 2) * L * M * d,
+                          1: 2 * L * M * (M**2 - L**2),
+                          2: h * L * M * d},
+        ('yz', 'x2-y2'): {0: Rational(3, 2) * M * N * d,
+                          1: -M * N * (1 + 2 * d),
+                          2: M * N * (1 + d / 2)},
+        ('zx', 'x2-y2'): {0: Rational(3, 2) * N * L * d,
+                          1: N * L * (1 - 2 * d),
+                          2: -N * L * (1 - d / 2)},
+        ('xy', 'z2'): {0: r3 * L * M * z2, 1: -2 * r3 * L * M * N**2,
+                       2: r3 * h * L * M * (1 + N**2)},
+        ('yz', 'z2'): {0: r3 * M * N * z2,
+                       1: r3 * M * N * (L**2 + M**2 - N**2),
+                       2: -r3 * h * M * N * (L**2 + M**2)},
+        ('zx', 'z2'): {0: r3 * L * N * z2,
+                       1: r3 * L * N * (L**2 + M**2 - N**2),
+                       2: -r3 * h * L * N * (L**2 + M**2)},
+        ('z2', 'z2'): {0: z2**2, 1: 3 * N**2 * (L**2 + M**2),
+                       2: Rational(3, 4) * (L**2 + M**2)**2},
+        ('x2-y2', 'x2-y2'): {0: Rational(3, 4) * d**2,
+                             1: L**2 + M**2 - d**2,
+                             2: N**2 + d**2 / 4},
+    }
+
+
+def verify(npts=40, tol=1e-11):
+    import random
+    import math
+    inv = {}
+    for l, dd in LABEL.items():
+        for m, name in dd.items():
+            inv[name] = (l, m)
+
+    pts = []
+    rng = random.Random(20260722)
+    while len(pts) < npts:
+        a, b, c = (rng.gauss(0, 1) for _ in range(3))
+        nrm = math.sqrt(a * a + b * b + c * c)
+        if nrm > 1e-3:
+            pts.append((a / nrm, b / nrm, c / nrm))
+
+    nfail = 0
+    ref = _ref()
+    for (o1, o2), rr in ref.items():
+        l1, m1 = inv[o1]
+        l2, m2 = inv[o2]
+        got = sk_coeffs(l1, m1, l2, m2)
+        for mu in set(rr) | set(got):
+            e = sp.expand(got.get(mu, 0) - rr.get(mu, 0))
+            worst = 0.0
+            for (a, b, c) in pts:
+                v = float(sp.re(sp.N(e.subs({L: a, M: b, N: c}))))
+                worst = max(worst, abs(v))
+            if worst >= tol:
+                nfail += 1
+                print(f'  FAIL <{o1}|{o2}> {GREEK[mu]}  maxdev={worst:.2e}')
+                print(f'       got {got.get(mu, 0)}')
+                print(f'       ref {rr.get(mu, 0)}')
+    print(f'verification: {len(ref)} entries checked, {nfail} mismatches')
+    return nfail
+
+
+def show(l1, l2):
+    print(f'--- l={l1}  l\'={l2} ---')
+    for m1 in sorted(LABEL[l1], key=lambda t: -t):
+        for m2 in sorted(LABEL[l2], key=lambda t: -t):
+            c = sk_coeffs(l1, m1, l2, m2)
+            terms = '  '.join(f'+ ({v}) V{GREEK[k]}' for k, v in sorted(c.items()))
+            print(f'  E[{LABEL[l1][m1]:>6},{LABEL[l2][m2]:>6}] = {terms or "0"}')
+    print()
+
+
+if __name__ == '__main__':
+    import sys
+    if 'table' in sys.argv:
+        for a in range(3):
+            for b in range(a, 3):
+                show(a, b)
+    verify()
