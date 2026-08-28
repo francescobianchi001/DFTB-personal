@@ -38,8 +38,9 @@ class MOViz:
             self.Ecoul, self.E, self.C = self.mol.SCF(tresh=tresh, alpha=alpha)
             self.Etot = float(np.sum(self.mol.P * self.mol.H0)) + self.Ecoul
         else:
-            self.Ecoul = self.Etot = None
+            self.Ecoul = None
             self.E, self.C = self.mol.diag()
+            self.Etot = self.mol.Eband           # no SCC: E_elec = E_band
         self.basis = self.mol.basis
         self.geom = geom
         self.f = self.mol.f                     # occupations, P, Eband all from diag()
@@ -329,6 +330,21 @@ class MOViz:
         print(f"  ({self.nocc} occupied of {self.nmo} MOs, "
               f"{self.f.sum():.1f} of {self.mol.nelec:.0f} electrons)\n")
 
+    def print_Etot(self):
+        """Total energy and its pieces. E_rep is not in it -- not implemented yet."""
+        print(f"\n{self.label}  total energy  ({self.geom})"
+              f"  [{'SCC' if self.scc else 'H0, no SCC'}]")
+        if self.scc:
+            rows = [('tr(P H0)', float(np.sum(self.mol.P * self.mol.H0))),
+                    ('E_coul', self.Ecoul)]
+        else:
+            rows = [('E_band', self.Eband)]
+        for name, e in rows:
+            print(f"  {name:>8} = {e:>13.6f} Ha = {e * HA:>11.3f} eV")
+        print('-' * 48)
+        print(f"  {'E_elec':>8} = {self.Etot:>13.6f} Ha = {self.Etot * HA:>11.3f} eV")
+        print(f"  {'E_rep':>8} =   not implemented -- E_tot is incomplete\n")
+
     def ao_labels(self):
         """One 'C1 2p+1' label per basis function, in basis order."""
         sh = 'spdfg'
@@ -521,6 +537,8 @@ if __name__ == '__main__':
                          'one "<symbol> <r0/bohr>" per line')
     ap.add_argument('--Eband', action='store_true',
                     help='print the band energy and exit')
+    ap.add_argument('--Etot', dest='Etot', action='store_true',
+                    help='print the total energy and exit')
     ap.add_argument('--P', action='store_true',
                     help='print the density matrix and exit')
     ap.add_argument('--S', dest='Smat', action='store_true',
@@ -542,7 +560,8 @@ if __name__ == '__main__':
                 vo=args.vo, lb94=args.lb94, r0_vo=args.r0_vo, r0=args.r0, typor0=args.typor0)
     viz.print_levels()
     printed = False
-    for flag, fn in ((args.Eband, viz.print_Eband), (args.mulliken, viz.print_charges),
+    for flag, fn in ((args.Etot, viz.print_Etot),
+                     (args.Eband, viz.print_Eband), (args.mulliken, viz.print_charges),
                      (args.dq, viz.print_charge_shifts),
                      (args.Hmat, viz.print_hamiltonian), (args.Smat, viz.print_overlap),
                      (args.P, viz.print_density)):
