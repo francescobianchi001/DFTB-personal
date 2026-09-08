@@ -384,13 +384,13 @@ class H:
         
         self.S[mu, mu] = 1.0
         self.H[mu, mu] = (self._radial_H(A, A) if self.ONSITE_CONSISTENT
-                          else self.eigN[A.elem][A.n][A.l])   # neutral on-site level
+                          else self.eigN[A.elem][A.n][A.l])
 
     def fill_cross(self, A, B, mu, nu):
         from Y_real import Y_real
         l1, l2 = A.l, B.l
         d = A.d[B.atom]
-        Lc, Mc, Nc = (B.R - A.R) / d                    # bond direction cosines A -> B
+        Lc, Mc, Nc = (B.R - A.R) / d                  
 
         key = (A.atom, A.n, l1, B.atom, B.n, l2)
         if key not in self._vcache:
@@ -401,29 +401,29 @@ class H:
         S_rot = V_rot = 0.0
         for o, (S_o, V_o) in chan.items():
             c = Y_real.rotations.get((l1, A.m, l2, B.m, o))
-            if c is None:                               # channel absent -> 0
+            if c is None:                           
                 continue
             w = c(Lc, Mc, Nc)
             S_rot += w * S_o
             V_rot += w * V_o
 
-        eps_a = self.eigenvalues[A.elem][A.n][l1]       # confined eps for the eps*S trick
+        eps_a = self.eigenvalues[A.elem][A.n][l1]      
         eps_b = self.eigenvalues[B.elem][B.n][l2]
         H_rot = 0.5 * (eps_a + eps_b) * S_rot + V_rot
         self.S[mu, nu] = self.S[nu, mu] = S_rot
         self.H[mu, nu] = self.H[nu, mu] = H_rot
 
     def H_matrix(self):
-        ensure_Y_real()                                # cache: generate only once
-        self._diag_key = None                          # stale diag results
+        ensure_Y_real()                              
+        self._diag_key = None                         
         self.E = self.C = self.f = self.P = self.Eband = None
-        self.space()                                   # basis + distance matrix + center
+        self.space()                                  
         self.H = np.zeros((self.N, self.N))
         self.S = np.zeros((self.N, self.N))
-        self._vcache = {}                              # bond-frame V_{ll'm} per shell pair
+        self._vcache = {}                             
         for mu, A in enumerate(self.basis):
             self.fill_diag(A, mu)
-        self._gkey = self._gval = None                 # last grid built (see _grid)
+        self._gkey = self._gval = None                
 
         for mu in range(self.N):
             for nu in range(mu + 1):       # lower triangle + diagonal
@@ -433,7 +433,7 @@ class H:
                         self.fill_onsite(A, B, mu, nu)
                 else:
                     self.fill_cross(A, B, mu, nu)
-        self.H0 = self.H.copy()                        # SCC overwrites self.H
+        self.H0 = self.H.copy()                        
         return self.H
 
     def occupations(self, E, tol=1e-5):
@@ -534,9 +534,7 @@ class H:
                    y[I][J]=y[J][I]=yIJ
         H0 = self.H0 
         Ec,E,C,Dq,h1 = self.SCC(H0,y,alpha=alpha)
-        for i in range(N):
-            
-            print(f"cycle {i}")
+        for i in range(N):            
             Ec_new,E_new,C_new,Dq_new,h1new = self.SCC(H0,y,h1,alpha)
             if abs(Ec_new - Ec) <= tresh and np.max(np.abs(Dq_new-Dq)) <= tresh:
                 return Ec_new,E_new,C_new
@@ -614,9 +612,12 @@ class Vrep_fit:
         if dimer:
             self.append_dimer(dimer,alpha=alpha,weight=weight)   # 1.137 Ang, hotbit CH.py
 
-    def get_otherVpairs(self,exclude=(6,1)):
+    PARDIR = Path('Vpot')/'par'/'EurPhysJD_67_38_2013'
+    FITDIR = Path('Vpot')/'par'/'fitted'
+
+    def get_otherVpairs(self,exclude=(6,1),path=None):
         # hotbit's tab={'CH':...,'rest':'default'}: C-C and H-H repulsion sits in E_wr
-        p = Path.cwd()/'Vpot'/'par'/'EurPhysJD_67_38_2013'
+        p = Path.cwd()/(self.PARDIR if path is None else path)
         V = {}
         for par in sorted(p.glob('*.par')):
             Z = tuple(sorted(ATOM_NAMES.index(s.lower()) for s in par.stem.split('_')))
@@ -634,6 +635,26 @@ class Vrep_fit:
                     rows.append([float(fl[0]),float(fl[1])])
             t = np.array(rows)
             V[Z] = (t[-1,0], CubicSpline(t[:,0],t[:,1]))
+        return V
+
+    def write_par(self,path=None,pair=('C','H'),n=101,rmin=0.18897259582,
+                  pool='deriv',lam=None,k=3):
+        # hotbit .par layout: r [a0], V_rep [Ha]; r < min fitted point is extrapolation
+        V = self.integration(lam=lam,k=k,pool=pool)
+        p = Path(path) if path else Path.cwd()/self.FITDIR/f'{pair[0]}_{pair[1]}.par'
+        p.parent.mkdir(parents=True,exist_ok=True)
+        r = np.linspace(rmin,self.Rcut,n)
+        p.write_text('repulsion_comment=\n'
+                     f'{pair[0]}-{pair[1]} pool={pool} Rcut={self.Rcut:.4f} '
+                     f'lam={lam} npoints={len(getattr(self,pool))}\n\n'
+                     'repulsion=\n'
+                     + '\n'.join(f'{ri:.11g} {float(V(ri)):.12g}' for ri in r) + '\n')
+        return p
+
+    def Vrep_all(self):
+        # every channel the gradient needs: fitted C-H + tabulated C-C, H-H
+        V = self.get_otherVpairs()
+        V.update(self.get_otherVpairs(exclude=(),path=self.FITDIR))
         return V
 
 
@@ -698,8 +719,6 @@ class Vrep_fit:
         o = x.argsort()
         x, y, w = x[o], y[o], w[o]
 
-        # splrep needs strictly increasing x: merge the points that coincide,
-        # weighted mean of the slopes, weights add up
         cut = np.r_[0, np.nonzero(np.diff(x) > tol)[0]+1, len(x)]
         g = [slice(a,b) for a,b in zip(cut[:-1],cut[1:])]
         x = np.array([x[i].mean() for i in g])
@@ -709,7 +728,6 @@ class Vrep_fit:
         m = x < self.Rcut
         x, y, w = x[m], y[m], w[m]
 
-        # anchor Vrep'(Rcut) = 0, weighted so the fit cannot walk away from it
         x = np.append(x,self.Rcut); y = np.append(y,0.0); w = np.append(w,1e3*w.max())
 
         if lam is None:
@@ -717,7 +735,6 @@ class Vrep_fit:
         self.tck = splrep(x, y, w, s=lam, k=min(k,len(x)-1))
         self.dVrep = BSpline(*self.tck)
 
-        # Vrep(r) = -int_r^Rcut Vrep'  ,  Vrep(Rcut) = 0
         A = self.dVrep.antiderivative()
         self.Vrep = lambda r: A(np.minimum(r,self.Rcut)) - A(self.Rcut)
         return self.Vrep
