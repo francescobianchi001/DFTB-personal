@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import matplotlib.pyplot as pl
 from scipy.integrate import simpson
+from scipy.interpolate import CubicSpline, splrep, BSpline
 from scipy import special
 import subprocess as sub
 from collections import namedtuple
@@ -24,7 +25,7 @@ def ensure_Y_real(path=Path("Y_real.py")):
 
 ensure_Y_real()
 
-Ubbard = {'C':0.376, 'H': 0.395,          # Koskinen sec.V D (adjusted)
+Ubbard = {'C':0.365, 'H': 0.420,          # hotbit Vpot/par/{C,H}.elm
           'O':0.4468, 'N': 0.530}         # O = IE-EA; N unbound anion -> Hotbit value
 
 def read_radii(path):
@@ -39,8 +40,9 @@ def read_radii(path):
     return radii
 
 
-def prepare_atoms(geom, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
-    atno, coords = get_coords(geom, maxlen=100)
+def prepare_atoms(geom, atno=None, vo=None, lb94=None, r0_vo=None, r0=None, typor0=None):
+    if atno is None:
+        atno, _ = get_coords(geom, maxlen=100)
     atoms = {ATOM_NAMES[int(Z)].capitalize(): int(Z) for Z in atno}
 
     p_bs = Path.cwd() / 'ATOMS_BS'
@@ -113,10 +115,16 @@ AO = namedtuple('AO', 'atom elem n l m u grid d R')
 class H:
 
     def __init__(self,distance=None,frozen_core=True,grid=None,geom='geometry.xyz',
-                 vo=None,lb94=None,r0_vo=None,r0=None,typor0=None):
+                 vo=None,lb94=None,r0_vo=None,r0=None,typor0=None, Vrep=False, coords=None,atom=None,
+                 charge=0):
 
-        prepare_atoms(geom, vo=vo, lb94=lb94, r0_vo=r0_vo, r0=r0, typor0=typor0)
-        atom,coords = get_coords(geom, maxlen=100)
+        if Vrep and geom is None and coords is not None and atom is not None:
+            atom,coords = atom,coords
+        else:
+            atom,coords = get_coords(geom, maxlen=100)
+
+        prepare_atoms(geom, atno=atom, vo=vo, lb94=lb94, r0_vo=r0_vo,
+                      r0=r0, typor0=typor0)
 
         p_bs = Path.cwd()/'ATOMS_BS'
         p_pot = Path.cwd()/'ATOMS_POT'
@@ -176,6 +184,7 @@ class H:
         self._diag_key = None           
         self.E = self.C = self.f = self.P = self.Eband = None
         self.frozen_core = frozen_core
+        self.charge = charge              # molecular charge; anion = -1
         self.distance = distance        
 
     def SK_int_parametre(self, distance):
@@ -273,6 +282,7 @@ class H:
                     self.nelec += self.occupied[e][n][l]
                     for m in range(-l, l + 1):
                         self.basis.append(AO(a, e, n, l, m, u, self.r[e], dAB[a], R))
+        self.nelec -= self.charge                         # neutral count + extra electrons
         self.N = len(self.basis)
         return self.N
 
@@ -525,7 +535,8 @@ class H:
         H0 = self.H0 
         Ec,E,C,Dq,h1 = self.SCC(H0,y,alpha=alpha)
         for i in range(N):
-
+            
+            print(f"cycle {i}")
             Ec_new,E_new,C_new,Dq_new,h1new = self.SCC(H0,y,h1,alpha)
             if abs(Ec_new - Ec) <= tresh and np.max(np.abs(Dq_new-Dq)) <= tresh:
                 return Ec_new,E_new,C_new
@@ -533,11 +544,215 @@ class H:
             Ec,E,C,Dq,h1 = Ec_new, E_new,C_new,Dq_new,h1new 
         raise RuntimeError(f"SCF: no convergence in {N} iterations "
                            f"(dEc={abs(Ec_new-Ec):.2e}, dDq={np.max(np.abs(Dq_new-Dq)):.2e}, tresh={tresh:.0e})")
+    
+    def E_tot(self,alpha=0.3):
+        Ec,E,C = self.SCF(alpha=alpha)
+        return float(np.sum(self.P * self.H0)) + Ec, E,C
 
-    def E_tot(self):
-        Ec,E,C = self.SCF()
-        return float(np.sum(self.P * self.H0)) + Ec, E,C  
+class Vrep_fit:
 
+    CHARGE = {'CH-': -1}
+
+    def __init__(self,distance=None,frozen_core=True,grid=None,
+                 vo=None,lb94=None,r0_vo=None,r0=None,typor0=None, Vrep=False,
+                 alpha=0.3,Rcut=3.40,tol=0.0095,omo=None,weight=1.0,s=0.02,
+                 dimer=None,other=True):
+        mols=self.collect_traj()
+        self.Rcut = Rcut
+        self.Vpair = self.get_otherVpairs() if other else {}
+        self.curves = {}
+        self.deriv = []
+        self.derivF = []
+        self._Hkw = dict(distance=distance,frozen_core=frozen_core,grid=grid,geom=None,
+                         vo=vo,lb94=lb94,r0_vo=r0_vo,r0=r0,typor0=typor0,Vrep=True)
+        for name, frames in mols.items():
+            q = self.CHARGE.get(name,0)
+
+            keep = []          
+            for fr in frames:
+                d, bond = self.bonds(fr,Rcut,omo)
+                N = int(bond.sum())
+                if N == 0:
+                    continue
+                spread = d[bond].max()-d[bond].min()
+                if spread > tol:
+                    raise ValueError(f"{name} frame {fr.frame}: bonds not equal "
+                                     f"(spread {spread:.2e} a0 > tol {tol:.2e})")
+                keep.append((fr,d,bond,N))
+            if len(keep) < 4:
+                continue
+
+            R, Ediff_tot, Vp = [], [], []
+            X = np.array([k[0].coords for k in keep])
+            for i,(fr,d,bond,N) in enumerate(keep):
+                R.append(d[bond].mean())
+                Ediff_tot.append((fr.E_DFT - self.E_wr(fr.coords,fr.atoms,q,alpha))/N)
+
+                if fr.F is None:
+                    continue
+                u = X[min(i+1,len(keep)-1)] - X[max(i-1,0)]
+                u /= np.linalg.norm(u)
+                g = self.get_g(fr,d,bond)      # grad_X sum_bonds r_IJ ; N*dRds = g.u
+                NdRds = float(g.ravel()@u.ravel())
+                dEds = self.finite_diff(self.E_wr(fr.coords+s*u,fr.atoms,q,alpha),
+                                        self.E_wr(fr.coords-s*u,fr.atoms,q,alpha), s)
+                Vp.append(-(float((fr.F*u).sum()) + dEds)/NdRds) 
+
+            R, Ediff_tot = np.array(R), np.array(Ediff_tot)
+            o = R.argsort()
+            R, Ediff_tot = R[o], Ediff_tot[o]
+
+            E_R = CubicSpline(R, Ediff_tot)
+            F_R = E_R(R,1)
+
+            w = weight/np.sqrt(len(R))
+            self.curves[name] = (R, Ediff_tot, F_R)
+            self.deriv += [(Ri, Fi, w) for Ri, Fi in zip(R, F_R)]
+            if len(Vp) == len(R):
+                self.derivF += [(Ri, Fi, w) for Ri, Fi in zip(R, np.array(Vp)[o])]
+
+        if dimer:
+            self.append_dimer(dimer,alpha=alpha,weight=weight)   # 1.137 Ang, hotbit CH.py
+
+    def get_otherVpairs(self,exclude=(6,1)):
+        # hotbit's tab={'CH':...,'rest':'default'}: C-C and H-H repulsion sits in E_wr
+        p = Path.cwd()/'Vpot'/'par'/'EurPhysJD_67_38_2013'
+        V = {}
+        for par in sorted(p.glob('*.par')):
+            Z = tuple(sorted(ATOM_NAMES.index(s.lower()) for s in par.stem.split('_')))
+            if Z == tuple(sorted(exclude)):
+                continue
+            rows, on = [], False
+            for ln in par.read_text().splitlines():
+                if ln.startswith('repulsion='):
+                    on = True
+                    continue
+                if on:
+                    fl = ln.split()
+                    if len(fl) != 2:
+                        break
+                    rows.append([float(fl[0]),float(fl[1])])
+            t = np.array(rows)
+            V[Z] = (t[-1,0], CubicSpline(t[:,0],t[:,1]))
+        return V
+
+
+    def get_g(self,fr,d,bond):
+        I,J = np.nonzero(bond)
+        nkJ = (fr.coords[I]-fr.coords[J])/d[I,J][:,None]
+        g = np.zeros_like(fr.coords)
+        np.add.at(g,I,nkJ)
+        np.add.at(g,J,-nkJ)
+        return g
+    
+    def bonds(self,fr,Rcut,omo=None,coords=None):
+        c = fr.coords if coords is None else coords
+        d = np.linalg.norm(c[None,:,:]-c[:,None,:],axis=-1)
+        if omo is not None:
+            bond =((fr.atoms[None,:] == omo) & (fr.atoms[:,None] == omo)
+                        & np.triu(np.ones_like(d,bool),1)
+                        & (d < Rcut))
+        else:
+            bond = ((fr.atoms[None,:]-fr.atoms[:,None] != 0)
+                & np.triu(np.ones_like(d,bool),1)
+                & (d < Rcut))
+        return d, bond
+
+    def E_elec(self,coords,atom,charge,alpha=0.3):
+        init = H(**self._Hkw, coords=coords[None], atom=atom, charge=charge)
+        init.H_matrix()
+        return init.E_tot(alpha)[0]
+
+    def E_other(self,coords,atom):
+        d = np.linalg.norm(coords[None,:,:]-coords[:,None,:],axis=-1)
+        iu = np.triu_indices(len(atom),1)
+        E = 0.0
+        for (Za,Zb),(rmax,V) in self.Vpair.items():
+            m = (((atom[iu[0]]==Za)&(atom[iu[1]]==Zb))
+                 |((atom[iu[0]]==Zb)&(atom[iu[1]]==Za)))
+            r = d[iu][m]
+            r = r[r < rmax]
+            E += float(V(r).sum()) if r.size else 0.0
+        return E
+
+    def E_wr(self,coords,atom,charge,alpha=0.3):
+        return self.E_elec(coords,atom,charge,alpha) + self.E_other(coords,atom)
+
+    def finite_diff(self,Ep,Em,h):
+        return (Ep-Em)/(2*h)
+
+    def append_dimer(self,R,Z=(6,1),q=0,weight=1.0,alpha=0.3,scale=1.025,
+                     pools=('deriv','derivF')):
+        # E_DFT'(R_eq)=0  ->  V'_rep(R) = -E_elec'(R)/N, N=1
+        Z = np.asarray(Z)
+        h = (scale-1)*R
+        xyz = lambda r: np.array([[0.,0.,0.],[r,0.,0.]])
+        dE = self.finite_diff(self.E_wr(xyz(R+h),Z,q,alpha),
+                              self.E_wr(xyz(R-h),Z,q,alpha), h)
+        for p in pools:
+            getattr(self,p).append((R,-dE,weight))
+        return R,-dE
+
+    def integration(self,lam=None,k=3,tol=1e-4,pool='deriv'):
+        x, y, w = (np.array(a) for a in zip(*getattr(self,pool)))
+        o = x.argsort()
+        x, y, w = x[o], y[o], w[o]
+
+        # splrep needs strictly increasing x: merge the points that coincide,
+        # weighted mean of the slopes, weights add up
+        cut = np.r_[0, np.nonzero(np.diff(x) > tol)[0]+1, len(x)]
+        g = [slice(a,b) for a,b in zip(cut[:-1],cut[1:])]
+        x = np.array([x[i].mean() for i in g])
+        y = np.array([np.dot(y[i],w[i])/w[i].sum() for i in g])
+        w = np.array([w[i].sum() for i in g])
+
+        m = x < self.Rcut
+        x, y, w = x[m], y[m], w[m]
+
+        # anchor Vrep'(Rcut) = 0, weighted so the fit cannot walk away from it
+        x = np.append(x,self.Rcut); y = np.append(y,0.0); w = np.append(w,1e3*w.max())
+
+        if lam is None:
+            lam = len(x) - np.sqrt(2*len(x))
+        self.tck = splrep(x, y, w, s=lam, k=min(k,len(x)-1))
+        self.dVrep = BSpline(*self.tck)
+
+        # Vrep(r) = -int_r^Rcut Vrep'  ,  Vrep(Rcut) = 0
+        A = self.dVrep.antiderivative()
+        self.Vrep = lambda r: A(np.minimum(r,self.Rcut)) - A(self.Rcut)
+        return self.Vrep
+
+    def collect_traj(self):
+        p = Path.cwd() /'Vpot'/'traj'
+        mol = {}
+        frame=namedtuple("frame", 'E_DFT Natoms atoms coords frame F')
+        for traj in sorted(p.glob('*.xyz')):
+            npz = Path.cwd()/'Vpot'/'data'/f'{traj.stem}.npz'
+            F_DFT = np.load(npz)['F']*0.0194469 if npz.exists() else None
+            lines = traj.read_text().splitlines()
+            frames = []
+            k = 0
+            while k < len(lines):
+                if not lines[k].split():  
+                    k += 1
+                    continue
+                Natoms = int(lines[k].split()[0])
+                head = lines[k+1].split()       
+                fr = int(head[1])
+                E_DFT = float(head[4])*0.0367493
+                atoms = []
+                coords = []
+                for line in lines[k+2:k+2+Natoms]:
+                    l = line.split()
+                    atoms.append(ATOM_NAMES.index(l[0].lower()))
+                    coords.append([float(x)*1.8897261246 for x in l[1:4]])
+                F = None if F_DFT is None or fr >= len(F_DFT) else F_DFT[fr]
+                frames.append(frame(E_DFT, Natoms, np.array(atoms),
+                                    np.array(coords), fr, F))
+                k += 2 + Natoms
+
+            mol[traj.stem]=frames
+        return mol
 
 
 
