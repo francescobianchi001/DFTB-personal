@@ -185,7 +185,9 @@ class H:
         self.E = self.C = self.f = self.P = self.Eband = None
         self.frozen_core = frozen_core
         self.charge = charge              # molecular charge; anion = -1
-        self.distance = distance        
+        self.distance = distance
+        self._kw = dict(distance=distance,frozen_core=frozen_core,grid=grid,geom=None,
+                        vo=vo,lb94=lb94,r0_vo=r0_vo,r0=r0,typor0=typor0,Vrep=True)
 
     def SK_int_parametre(self, distance):
 
@@ -296,9 +298,9 @@ class H:
     def cross_terms(self,A,B,o=None):
         from Y_real import Y_real
         if o is None:
-            o = abs(A.m)                                            # sigma/pi/delta channel
+            o = abs(A.m)                     
         d = A.d[B.atom]
-        rA, rB, X, zc, W = self._sk_grid(d)    # prolate spheroidal GL mesh for this pair
+        rA, rB, X, zc, W = self._sk_grid(d)   
 
         wall_A = self.Vconf[A.elem]
         if (A.n, A.l) in self.vo_shells[A.elem] and self.Vconf_VO[A.elem] is not None:
@@ -312,7 +314,6 @@ class H:
         Vn_B = self.Vneutral[B.elem]
         AW = Y_real.angular_weights[(A.l, B.l, o)]
 
-        # S_SK and Vint integrands on the (xi, eta) mesh; rA, rB come from the grid.
         def integrand(Zc):
             RA = self._ev(('R', A.elem, A.n, A.l), A.grid, A.u / A.grid, rA)
             RB = self._ev(('R', B.elem, B.n, B.l), B.grid, B.u / B.grid, rB)
@@ -420,7 +421,7 @@ class H:
         self.space()                                  
         self.H = np.zeros((self.N, self.N))
         self.S = np.zeros((self.N, self.N))
-        self._vcache = {}                             
+        self._vcache = {}
         for mu, A in enumerate(self.basis):
             self.fill_diag(A, mu)
         self._gkey = self._gval = None                
@@ -519,7 +520,7 @@ class H:
 
         return Ecoul,E,C,Dq,h1
 
-    def SCF(self,tresh=1e-5,N=400,alpha=0.3):
+    def SCF(self,tresh=1e-9,N=400,alpha=0.3):
         R = self.dist
         U = np.array([Ubbard[self.names[self.Z2elem[Z]]] for Z in self.atoms])
         FWHM = 1.329/U
@@ -532,11 +533,12 @@ class H:
                    CIJ = np.sqrt(4*np.log(2)/((FWHM[I])**2+FWHM[J]**2))
                    yIJ = special.erf(CIJ*R[I][J])/R[I][J]
                    y[I][J]=y[J][I]=yIJ
-        H0 = self.H0 
+        H0 = self.H0
         Ec,E,C,Dq,h1 = self.SCC(H0,y,alpha=alpha)
         for i in range(N):            
             Ec_new,E_new,C_new,Dq_new,h1new = self.SCC(H0,y,h1,alpha)
             if abs(Ec_new - Ec) <= tresh and np.max(np.abs(Dq_new-Dq)) <= tresh:
+                self.Dq, self.gamma = Dq_new, y
                 return Ec_new,E_new,C_new
             
             Ec,E,C,Dq,h1 = Ec_new, E_new,C_new,Dq_new,h1new 
@@ -590,7 +592,7 @@ class Vrep_fit:
                     continue
                 u = X[min(i+1,len(keep)-1)] - X[max(i-1,0)]
                 u /= np.linalg.norm(u)
-                g = self.get_g(fr,d,bond)      # grad_X sum_bonds r_IJ ; N*dRds = g.u
+                g = self.get_g(fr,d,bond)      
                 NdRds = float(g.ravel()@u.ravel())
                 dEds = self.finite_diff(self.E_wr(fr.coords+s*u,fr.atoms,q,alpha),
                                         self.E_wr(fr.coords-s*u,fr.atoms,q,alpha), s)
@@ -610,14 +612,15 @@ class Vrep_fit:
                 self.derivF += [(Ri, Fi, w) for Ri, Fi in zip(R, np.array(Vp)[o])]
 
         if dimer:
-            self.append_dimer(dimer,alpha=alpha,weight=weight)   # 1.137 Ang, hotbit CH.py
+            self.append_dimer(dimer,alpha=alpha,weight=weight)   
 
     PARDIR = Path('Vpot')/'par'/'EurPhysJD_67_38_2013'
     FITDIR = Path('Vpot')/'par'/'fitted'
 
-    def get_otherVpairs(self,exclude=(6,1),path=None):
+    @classmethod
+    def get_otherVpairs(cls,exclude=(6,1),path=None):
         # hotbit's tab={'CH':...,'rest':'default'}: C-C and H-H repulsion sits in E_wr
-        p = Path.cwd()/(self.PARDIR if path is None else path)
+        p = Path.cwd()/(cls.PARDIR if path is None else path)
         V = {}
         for par in sorted(p.glob('*.par')):
             Z = tuple(sorted(ATOM_NAMES.index(s.lower()) for s in par.stem.split('_')))
@@ -651,10 +654,11 @@ class Vrep_fit:
                      + '\n'.join(f'{ri:.11g} {float(V(ri)):.12g}' for ri in r) + '\n')
         return p
 
-    def Vrep_all(self):
+    @classmethod
+    def Vrep_all(cls):
         # every channel the gradient needs: fitted C-H + tabulated C-C, H-H
-        V = self.get_otherVpairs()
-        V.update(self.get_otherVpairs(exclude=(),path=self.FITDIR))
+        V = cls.get_otherVpairs()
+        V.update(cls.get_otherVpairs(exclude=(),path=cls.FITDIR))
         return V
 
 
@@ -771,20 +775,58 @@ class Vrep_fit:
             mol[traj.stem]=frames
         return mol
 
+class Gradients_opt:
 
+    def __init__(self,mol,Vpair=None,alpha=0.3):
+        self.mol = mol
+        self.alpha = alpha
+        self.Vpair = Vrep_fit.Vrep_all() if Vpair is None else Vpair
+        self.dV = {k: V.derivative() for k,(rmax,V) in self.Vpair.items()}
 
+    def _pairs(self,coords):
+        Z = self.mol.atoms
+        n = coords[:,None,:]-coords[None,:,:]        # n[I,J] = R_I - R_J
+        d = np.linalg.norm(n,axis=-1)
+        up = np.triu(np.ones_like(d,bool),1)
+        for k,(rmax,V) in self.Vpair.items():
+            Za,Zb = k
+            m = (((Z[:,None]==Za)&(Z[None,:]==Zb))|((Z[:,None]==Zb)&(Z[None,:]==Za)))
+            I,J = np.nonzero(m & up & (d < rmax))    # rmax: V_rep == 0 past the table
+            if len(I):
+                yield k, I, J, d[I,J], n[I,J]
 
+    def E_rep(self,coords):
+        return sum(float(self.Vpair[k][1](r).sum())
+                   for k,I,J,r,_ in self._pairs(coords))
 
+    def grad_rep(self,coords):
+        # dE_rep/dR_K = sum_J V'(r_KJ) nhat_KJ
+        g = np.zeros_like(coords)
+        for k,I,J,r,n in self._pairs(coords):
+            t = self.dV[k](r)[:,None] * n/r[:,None]
+            np.add.at(g,I,t)
+            np.add.at(g,J,-t)
+        return g
 
+    def E(self,coords):
+        m = H(**self.mol._kw, coords=coords[None], atom=self.mol.atoms,
+              charge=self.mol.charge)
+        m.H_matrix()
+        return m.E_tot(self.alpha)[0] + self.E_rep(coords)
 
+    def num(self,h=1e-3):
+        # dE/dX, NOT the force (F = -dE/dX). 6*natoms SCF runs.
+        X = self.mol.coords[0]
+        g = np.zeros_like(X)
+        for K in range(len(X)):
+            for c in range(3):
+                Xp, Xm = X.copy(), X.copy()
+                Xp[K,c] += h
+                Xm[K,c] -= h
+                g[K,c] = self.finite_diff(self.E(Xp),self.E(Xm),h)
+        return g
 
-
-
-            
-
-
-        
-
-
+    def finite_diff(self,Ep,Em,h):
+        return (Ep-Em)/(2*h)
 
 
