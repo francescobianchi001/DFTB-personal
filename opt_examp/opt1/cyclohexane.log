@@ -1,0 +1,11 @@
+step           E [Ha]      dE [Ha]  |g|max [Ha/a0]  step [a0]
+   0     -15.33309851                     0.001315           
+   1     -15.33312374    -2.52e-05        0.001315     0.0031
+   2     -15.33314263    -1.89e-05        0.001605     0.0031
+   3     -15.33316081    -1.82e-05        0.001840     0.0031
+   4     -15.33316396    -3.15e-06        0.001196     0.0031
+   5     -15.33318671    -2.27e-05        0.002305     0.0031
+
+converged: True   steps: 5   E = -15.33318671 Ha   |g|max = 0.000784 Ha/a0
+geometry -> opt_examp/cyclohexane_opt.xyz
+trajectory -> opt_examp/cyclohexane_traj.xyz

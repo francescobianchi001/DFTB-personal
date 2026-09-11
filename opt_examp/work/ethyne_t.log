@@ -1,0 +1,6 @@
+step           E [Ha]      dE [Ha]      |g|max   step[a0]   nE
+   0      -4.14621726                 0.000449
+   1      -4.14621780    -5.38e-07    0.000449     0.0012   18
+   2      -4.14621784    -3.85e-08    0.000301     0.0001   22
+
+converged: True   steps: 2   gradients: 3   line-search energies: 40   E = -4.14621784 Ha   |g|max = 0.000005
