@@ -511,14 +511,14 @@ class H:
         Ecoul = 1/2*Dq@y@Dq
         
         e = np.array([y[i,:]@Dq for i in range(len(self.atoms))])
-        eAO = np.array([e[ao.atom] for ao in self.basis])      
-        h1 = 0.5 * self.S * (eAO[:,None] + eAO[None,:])                                  
-        if h1old is not None:
-            h1 = merge(h1old,h1)
+        eAO = np.array([e[ao.atom] for ao in self.basis])
+        h1out = 0.5 * self.S * (eAO[:,None] + eAO[None,:])
+        res = np.inf if h1old is None else np.max(np.abs(h1out-h1old))
+        h1 = h1out if h1old is None else merge(h1old,h1out)
         H = H0 + h1
         E,C = self.diag(H=H)
 
-        return Ecoul,E,C,Dq,h1
+        return Ecoul,E,C,Dq,h1,res
 
     def SCF(self,tresh=1e-9,N=400,alpha=0.3):
         R = self.dist
@@ -534,16 +534,19 @@ class H:
                    yIJ = special.erf(CIJ*R[I][J])/R[I][J]
                    y[I][J]=y[J][I]=yIJ
         H0 = self.H0
-        Ec,E,C,Dq,h1 = self.SCC(H0,y,alpha=alpha)
-        for i in range(N):            
-            Ec_new,E_new,C_new,Dq_new,h1new = self.SCC(H0,y,h1,alpha)
-            if abs(Ec_new - Ec) <= tresh and np.max(np.abs(Dq_new-Dq)) <= tresh:
+        Ec,E,C,Dq,h1,res = self.SCC(H0,y,alpha=alpha)
+        for i in range(N):
+            Ec_new,E_new,C_new,Dq_new,h1new,res = self.SCC(H0,y,h1,alpha)
+            dEc, dDq = abs(Ec_new-Ec), np.max(np.abs(Dq_new-Dq))
+            if res <= tresh:
                 self.Dq, self.gamma = Dq_new, y
+                self.res = res
                 return Ec_new,E_new,C_new
-            
-            Ec,E,C,Dq,h1 = Ec_new, E_new,C_new,Dq_new,h1new 
+
+            Ec,E,C,Dq,h1 = Ec_new, E_new,C_new,Dq_new,h1new
         raise RuntimeError(f"SCF: no convergence in {N} iterations "
-                           f"(dEc={abs(Ec_new-Ec):.2e}, dDq={np.max(np.abs(Dq_new-Dq)):.2e}, tresh={tresh:.0e})")
+                           f"(res={res:.2e}, tresh={tresh:.0e}; last step dEc={dEc:.2e}, "
+                           f"dDq={dDq:.2e}, max|Dq|={np.max(np.abs(Dq)):.2f} e, alpha={alpha})")
     
     def E_tot(self,alpha=0.3):
         Ec,E,C = self.SCF(alpha=alpha)
