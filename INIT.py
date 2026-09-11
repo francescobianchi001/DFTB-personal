@@ -26,6 +26,7 @@ from pathlib import Path
 ATOMS = {
     "C": 6,
     "H": 1,
+    "N": 7,
     "O": 8,
 }
 
