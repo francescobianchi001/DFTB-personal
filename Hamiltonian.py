@@ -811,25 +811,153 @@ class Gradients_opt:
             np.add.at(g,J,-t)
         return g
 
-    def E(self,coords):
+    def _at(self,coords,scf=True):
+        # fresh H at this geometry: **_kw or the cached basis/SK grids shift E_tot
         m = H(**self.mol._kw, coords=coords[None], atom=self.mol.atoms,
               charge=self.mol.charge)
         m.H_matrix()
-        return m.E_tot(self.alpha)[0] + self.E_rep(coords)
+        if scf:
+            m.Etot = m.E_tot(self.alpha)[0]
+        return m
 
-    def num(self,h=1e-3):
-        # dE/dX, NOT the force (F = -dE/dX). 6*natoms SCF runs.
-        X = self.mol.coords[0]
-        g = np.zeros_like(X)
+    def E(self,coords):
+        return self._at(coords).Etot + self.E_rep(coords)
+
+    def num(self,f=None,h=1e-3,X=None):
+        # df/dX by central differences, f(coords) scalar or array -> (natoms,3)+f.shape.
+        # Default f=E gives dE/dX, NOT the force (F = -dE/dX). 6*natoms SCF runs.
+        f = self.E if f is None else f
+        X = self.mol.coords[0] if X is None else X
+        g = None
         for K in range(len(X)):
             for c in range(3):
                 Xp, Xm = X.copy(), X.copy()
                 Xp[K,c] += h
                 Xm[K,c] -= h
-                g[K,c] = self.finite_diff(self.E(Xp),self.E(Xm),h)
+                d = self.finite_diff(np.asarray(f(Xp)),np.asarray(f(Xm)),h)
+                if g is None:
+                    g = np.zeros(X.shape + d.shape)
+                g[K,c] = d
         return g
 
     def finite_diff(self,Ep,Em,h):
         return (Ep-Em)/(2*h)
+
+    @staticmethod
+    def _grad_c(c,n,h=1e-5):
+        # rotations[...] are polynomials in (L,M,N); the off-sphere step is
+        # harmless, the tangential projector in dmatrices kills the radial part
+        g = np.empty(3)
+        for i in range(3):
+            p, q = n.copy(), n.copy()
+            p[i] += h
+            q[i] -= h
+            g[i] = (c(*p)-c(*q))/(2*h)
+        return g
+
+    def _dchannels(self,m,A,B,h=1e-3):
+        # (S_o, V_o, dS_o/dd, dV_o/dd) per channel for one SHELL pair.
+        # cross_terms depends on the scalar d alone -> 2 extra calls per channel.
+        key = (A.atom,A.n,A.l,B.atom,B.n,B.l)
+        if key in self._dcache:
+            return self._dcache[key]
+        d = A.d[B.atom]
+        nch = range(min(A.l,B.l)+1)
+        def chan(dd):
+            row = A.d.copy()
+            row[B.atom] = dd                      # cross_terms reads A.d[B.atom]
+            return [m.cross_terms(A._replace(d=row),B,o) for o in nch]
+        c0 = m._vcache.get(key)
+        c0 = [c0[o] for o in nch] if c0 is not None else chan(d)
+        cp, cm = chan(d+h), chan(d-h)
+        out = [(S,V,(Sp-Sm)/(2*h),(Vp-Vm)/(2*h))
+               for (S,V),(Sp,Vp),(Sm,Vm) in zip(c0,cp,cm)]
+        self._dcache[key] = out
+        return out
+
+    def dmatrices(self,m,h=1e-3):
+        # dS/dR_K, dH0/dR_K with shape (natoms,3,nao,nao).
+        # S_rot = sum_o c_o(n) S_o(d) with n = (R_B-R_A)/d, so the angular term
+        # is needed whenever l>0 -- dropping it still LOOKS like a gradient.
+        from Y_real import Y_real
+        nat, nao = len(m.atoms), m.N
+        dS = np.zeros((nat,3,nao,nao))
+        dH = np.zeros((nat,3,nao,nao))
+        self._dcache = {}
+        for mu in range(nao):
+            for nu in range(mu):                  # same-atom blocks: no geometry
+                A, B = m.basis[mu], m.basis[nu]
+                if A.atom == B.atom:
+                    continue
+                d = A.d[B.atom]
+                n = (B.R-A.R)/d
+                Pt = (np.eye(3)-np.outer(n,n))/d  # dn/dR_B, tangential
+                rS = rV = 0.0
+                aS, aV = np.zeros(3), np.zeros(3)
+                for o,(S_o,V_o,dS_o,dV_o) in enumerate(self._dchannels(m,A,B,h)):
+                    c = Y_real.rotations.get((A.l,A.m,B.l,B.m,o))
+                    if c is None:
+                        continue
+                    w = c(*n)
+                    rS += w*dS_o
+                    rV += w*dV_o
+                    gc = self._grad_c(c,n)
+                    aS += S_o*gc
+                    aV += V_o*gc
+                tS = rS*n + Pt@aS                 # d/dR_B; d/dR_A = -tS
+                tV = rV*n + Pt@aV
+                eps = 0.5*(m.eigenvalues[A.elem][A.n][A.l]
+                           + m.eigenvalues[B.elem][B.n][B.l])
+                tH = eps*tS + tV
+                for K,s in ((B.atom,1.0),(A.atom,-1.0)):
+                    dS[K,:,mu,nu] += s*tS
+                    dS[K,:,nu,mu] += s*tS
+                    dH[K,:,mu,nu] += s*tH
+                    dH[K,:,nu,mu] += s*tH
+        return dS, dH
+
+    @staticmethod
+    def gamma_C(m):
+        # the erf width of SCF(), kept in one place so the derivative cannot drift
+        U = np.array([Ubbard[m.names[m.Z2elem[Z]]] for Z in m.atoms])
+        F = 1.329/U
+        return np.sqrt(4*np.log(2)/(F[:,None]**2+F[None,:]**2))
+
+    def grad_gamma(self,m):
+        # dE_coul/dR_K = Dq_K sum_J Dq_J gamma'(R_KJ) nhat_KJ, closed form:
+        # gamma = erf(CR)/R -> (2C/sqrt(pi))exp(-C^2R^2)/R - erf(CR)/R^2.
+        # gamma_II = U_I is a constant, so there is no self term.
+        R = m.dist
+        off = ~np.eye(len(R),dtype=bool)
+        C = self.gamma_C(m)
+        Rs = np.where(off,R,1.0)                       # keep the diagonal finite
+        gp = np.where(off,(2*C/np.sqrt(np.pi))*np.exp(-(C*Rs)**2)/Rs
+                          - special.erf(C*Rs)/Rs**2, 0.0)
+        X = m.coords[0]
+        nh = np.where(off[...,None],(X[:,None,:]-X[None,:,:])/Rs[...,None],0.0)
+        return np.einsum('KJ,KJc->Kc',m.Dq[:,None]*m.Dq[None,:]*gp,nh)
+
+    def grad(self,coords=None,h=1e-3):
+        # eq 43 as dE/dR, NOT the force. One SCF + one dmatrices, and P/C/f/eps
+        # are held FIXED: at convergence E is variational, so there is no dDq/dR.
+        X = self.mol.coords[0] if coords is None else coords
+        return self._grad_from(self._at(X),X,h)
+
+    def _grad_from(self,m,X,h=1e-3):
+        W = (m.C*(m.f*m.E)) @ m.C.T             # energy-weighted density (Pulay)
+        e = m.gamma @ m.Dq                      # e_I = sum_J gamma_IJ Dq_J
+        eAO = np.array([e[ao.atom] for ao in m.basis])
+        h1 = 0.5*(eAO[:,None]+eAO[None,:])      # NOT SCC's h1, which carries S
+        dS, dH0 = self.dmatrices(m,h)
+        g  = np.einsum('mn,Kcmn->Kc',m.P,dH0)
+        g += np.einsum('mn,Kcmn->Kc',h1*m.P-W,dS)
+        return g + self.grad_gamma(m) + self.grad_rep(X)
+
+    def E_and_grad(self,coords=None,h=1e-3):
+        # E and dE/dR from ONE SCF -- grad() already had Etot and threw it away.
+        # Costs the same as grad() alone, which is what makes a Wolfe search cheap.
+        X = self.mol.coords[0] if coords is None else coords
+        m = self._at(X)
+        return m.Etot + self.E_rep(X), self._grad_from(m,X,h)
 
 

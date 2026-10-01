@@ -113,27 +113,96 @@ class CG:
 
 # ---------------------------------------------------------------- line search
 
+# Both searches return (s, E, new_coords, g_new); g_new is None when the search
+# never evaluated a gradient, and the driver then has to compute one itself.
+
 def line_search(grad, coords, p, E0, g0, smax, c1=1e-4, rho=0.5, nmax=12):
-    # backtracking Armijo along p; energies are ~90x cheaper than a gradient
-    # here, so a cubic/Brent search would be nearly free -- swap this out.
+    # backtracking Armijo along p. An energy is only ~3.3x cheaper than an
+    # analytic gradient (0.57 vs 1.9 s, butane), so probes are NOT free and
+    # `wolfe` below -- which pays one fused E+gradient per probe -- wins.
     slope = float(g0.ravel() @ p.ravel())
     if slope >= 0:
-        return None, None, None
+        return None, None, None, None
     s = smax
     for _ in range(nmax):
         E = grad.E(coords + s*p)
         if E <= E0 + c1*s*slope:
-            return s, E, coords + s*p
+            return s, E, coords + s*p, None
         s *= rho
+    return None, None, None, None
+
+
+def wolfe(fg, E0, d0, smax, c1=1e-4, c2=0.1, nmax=12):
+    """Strong Wolfe line search (Nocedal-Wright alg. 3.5/3.6).
+
+    fg(s) -> (phi, dphi, g) with phi = E(x+s p), dphi = g(x+s p).p, g the full
+    gradient. One fused E_and_grad per trial, and the gradient at the accepted
+    step is returned so the caller does not pay a separate per-step gradient.
+    c2 < 0.5 is what keeps a Polak-Ribiere direction descending.
+    """
+    def interp(a, fa, da, b, fb, db):
+        # cubic through (a,fa,da),(b,fb,db); bisect if it lands outside (a,b)
+        t = da + db - 3*(fa-fb)/(a-b)
+        r = t*t - da*db
+        lo, hi = (a, b) if a < b else (b, a)
+        if r <= 0:
+            return 0.5*(a+b)
+        q = np.sqrt(r)*(1 if b > a else -1)
+        den = db - da + 2*q
+        if den == 0:
+            return 0.5*(a+b)
+        s = b - (b-a)*(db+q-t)/den
+        pad = 1e-3*(hi-lo)
+        return s if lo+pad < s < hi-pad else 0.5*(a+b)
+
+    def zoom(lo, flo, dlo, hi, fhi, dhi, budget):
+        for _ in range(budget):
+            s = interp(lo, flo, dlo, hi, fhi, dhi)
+            f, d, g = fg(s)
+            if f > E0 + c1*s*d0 or f >= flo:
+                hi, fhi, dhi = s, f, d
+            else:
+                if abs(d) <= -c2*d0:               # strong Wolfe satisfied
+                    return s, f, g
+                if d*(hi-lo) >= 0:
+                    hi, fhi, dhi = lo, flo, dlo
+                lo, flo, dlo = s, f, d
+        return None, None, None
+
+    if d0 >= 0:                                    # not a descent direction
+        return None, None, None
+    s_prev, f_prev, d_prev = 0.0, E0, d0
+    s = smax
+    for i in range(nmax):
+        f, d, g = fg(s)
+        if f > E0 + c1*s*d0 or (i and f >= f_prev):
+            return zoom(s_prev, f_prev, d_prev, s, f, d, nmax-i)
+        if abs(d) <= -c2*d0:
+            return s, f, g
+        if d >= 0:                                 # passed the minimum
+            return zoom(s, f, d, s_prev, f_prev, d_prev, nmax-i)
+        s_prev, f_prev, d_prev = s, f, d
+        s = min(2*s, 64*smax)
     return None, None, None
+
+
+def wolfe_search(grad, coords, p, E0, g0, smax, **kw):
+    # driver-facing wrapper: same 4-tuple convention as line_search
+    def fg(s):
+        Es, gs = grad.E_and_grad(coords + s*p)
+        return Es, float(gs.ravel() @ p.ravel()), gs
+
+    s, E, g = wolfe(fg, E0, float(g0.ravel() @ p.ravel()), smax, **kw)
+    return (None, None, None, None) if s is None else (s, E, coords + s*p, g)
 
 
 # ---------------------------------------------------------------------- driver
 
 def optimise(geom='H5C10.xyz', out=None, traj=None, method=None, alpha=0.05,
              scale=1.54, amp=None, seed=0, ftol=1e-3, maxstep=0.2, nmax=200,
-             typor0=True):
+             typor0=True, search='wolfe'):
 
+    search = {'wolfe': wolfe_search, 'armijo': line_search}[search]
     stem = Path(geom).stem
     out = Path(out or f'{stem}_opt.xyz')
     traj = Path(traj or f'{stem}_traj.xyz')
@@ -153,8 +222,7 @@ def optimise(geom='H5C10.xyz', out=None, traj=None, method=None, alpha=0.05,
         method.restart = 3*len(mol.atoms)
     method.reset()
 
-    E = grad.E(coords)
-    g = grad.num()                                   # dE/dR, NOT the force
+    E, g = grad.E_and_grad(coords)                   # dE/dR, NOT the force
     write_xyz(traj, mol.atoms, coords, f'step 0  E = {E:.8f} Ha')
 
     print(f'{"step":>4} {"E [Ha]":>16} {"dE [Ha]":>12} '
@@ -169,7 +237,7 @@ def optimise(geom='H5C10.xyz', out=None, traj=None, method=None, alpha=0.05,
 
         p = method.direction(g, coords)
         smax = maxstep/np.abs(p).max()               # trust radius on displacement
-        s, Enew, new = line_search(grad, coords, p, E, g, smax)
+        s, Enew, new, gnew = search(grad, coords, p, E, g, smax)
 
         if s is None:                                # no downhill point: restart
             if isinstance(method, SD) or method.g_old is None:
@@ -186,7 +254,7 @@ def optimise(geom='H5C10.xyz', out=None, traj=None, method=None, alpha=0.05,
               f'{gmax:>15.6f} {s*np.abs(p).max():>10.4f}', flush=True)
 
         coords, E = new, Enew
-        g = grad.num()
+        g = gnew if gnew is not None else grad.grad(coords)   # wolfe already has it
         write_xyz(traj, mol.atoms, coords,
                   f'step {it}  E = {E:.8f} Ha  |g|max = {np.abs(g).max():.6f}',
                   mode='a')

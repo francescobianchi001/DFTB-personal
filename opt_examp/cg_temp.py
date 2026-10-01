@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from Hamiltonian import H, Gradients_opt
-from optimisation import write_xyz, update_geometry
+from optimisation import write_xyz, update_geometry, wolfe
 
 ROOT = Path(__file__).resolve().parent
 
@@ -46,8 +46,10 @@ class CG:
 
 
 def line_min(E, E0, smax, tol=0.1, nmax=14):
-    """Approximate exact line search on energies alone (a gradient costs 6N of these,
-    so this is ~10% overhead and CG needs the accuracy)."""
+    """Approximate exact line search on energies alone. Kept for comparison only
+    (`search='line_min'`): it was ~10% overhead when a gradient cost 6N energies,
+    but against the analytic gradient it costs 13 energies/step and `wolfe` wins
+    2.5x. `wolfe` now lives in optimisation.py."""
     s1 = smax
     e1 = E(s1)
     if e1 < E0:                                        # expand while improving
@@ -90,7 +92,7 @@ def line_min(E, E0, smax, tol=0.1, nmax=14):
     return (b, fb) if fb < E0 else (None, None)
 
 
-def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200):
+def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200, search='wolfe'):
     geom = str(ROOT/f'{name}.xyz')
     out, traj = str(ROOT/f'{name}_opt.xyz'), str(ROOT/f'{name}_traj.xyz')
 
@@ -99,8 +101,7 @@ def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200):
     method = CG(restart=3*len(mol.atoms))
 
     coords = mol.coords[0].copy()
-    E = grad.E(coords)
-    g = grad.num()
+    E, g = grad.E_and_grad(coords)
     write_xyz(traj, mol.atoms, coords, f'step 0  E = {E:.8f} Ha')
     print(f'{"step":>4} {"E [Ha]":>16} {"dE [Ha]":>12} {"|g|max":>11} '
           f'{"step[a0]":>10} {"nE":>4}', flush=True)
@@ -115,11 +116,20 @@ def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200):
 
         cnt = [0]
 
-        def f(s):
-            cnt[0] += 1
-            return grad.E(coords + s*p)
+        if search == 'wolfe':
+            def fg(s):
+                cnt[0] += 1
+                Es, gs = grad.E_and_grad(coords + s*p)
+                return Es, float(gs.ravel() @ p.ravel()), gs
 
-        s, Enew = line_min(f, E, smax)
+            s, Enew, gnew = wolfe(fg, E, float(g.ravel() @ p.ravel()), smax)
+        else:
+            def f(s):
+                cnt[0] += 1
+                return grad.E(coords + s*p)
+
+            s, Enew = line_min(f, E, smax)
+            gnew = None
         if s is None:
             if method.g_old is None or method.n <= 1:
                 print('line search failed from steepest descent, stopping')
@@ -133,7 +143,7 @@ def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200):
         gmax, Eprev = np.abs(g).max(), E
         coords = update_geometry(mol, coords, p, s, out, f'step {it}  E = {Enew:.8f} Ha')
         E = Enew
-        g = grad.num()
+        g = gnew if gnew is not None else grad.grad(coords)   # wolfe already has it
         print(f'{it:>4} {E:>16.8f} {E-Eprev:>12.2e} {gmax:>11.6f} '
               f'{s*np.abs(p).max():>10.4f} {cnt[0]:>4}', flush=True)
         write_xyz(traj, mol.atoms, coords,
@@ -142,8 +152,10 @@ def optimise_cg(name, alpha=0.3, ftol=1e-3, maxstep=0.20, nmax=200):
     gmax = np.abs(g).max()
     write_xyz(out, mol.atoms, coords,
               f'{name} optimised (CG)  E = {E:.8f} Ha  |g|max = {gmax:.6f}')
-    print(f'\nconverged: {gmax < ftol}   steps: {it}   gradients: {it+1}   '
-          f'line-search energies: {nE}   E = {E:.8f} Ha   |g|max = {gmax:.6f}')
+    ng = nE+1 if search == 'wolfe' else it+1        # wolfe fuses E and gradient
+    print(f'\nconverged: {gmax < ftol}   steps: {it}   search: {search}   '
+          f'gradients: {ng}   line-search energies: {nE}   '
+          f'E = {E:.8f} Ha   |g|max = {gmax:.6f}')
     return coords, E, g
 
 
